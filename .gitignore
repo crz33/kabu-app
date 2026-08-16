@@ -3,3 +3,6 @@ __pycache__/
 .venv/
 .env
 .DS_Store
+
+# Mac でデバッグするときの KABU_DATA_DIR
+.data/
