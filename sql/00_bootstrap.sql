@@ -30,7 +30,8 @@ CREATE DATABASE kabu
 \connect kabu
 
 -- 接続権限 -------------------------------------------------------------------
-REVOKE CONNECT ON DATABASE kabu FROM PUBLIC;
+-- ALL を落とす。CONNECT だけ revoke すると TEMPORARY が残る。
+REVOKE ALL     ON DATABASE kabu FROM PUBLIC;
 GRANT  CONNECT ON DATABASE kabu TO kabu_dev, kabu_app, kabu_ro;
 
 -- スキーマ -------------------------------------------------------------------
