@@ -2,7 +2,7 @@
 
 kabu の本番コード。取得バッチ、DB スキーマ、XBRL パーサ。**public**。
 
-Mac で開発し、ラズパイが pull して実行する。バッチは cron ではなく systemd timer で回し、冪等に作る。
+Mac で開発し、ラズパイが pull して実行する。バッチは cron で回し、冪等に作る。
 
 ## 開発環境
 
@@ -126,6 +126,30 @@ uv run alembic upgrade head --sql    # DB に触らず SQL を確認
 | `stock_snapshots` | JPX 一覧の基準日ごとの全銘柄。市場変更や業種変更を後から追うため |
 
 JPX の銘柄一覧 (`data_j.xls`) には `日付` 列があり、これが基準日になる。JPX は月末時点のデータを 1 か月ほど遅れて公開するため、取得日とは一致しない。`stock_snapshots.base_date` にはこの `日付` 列を使う。
+
+## バッチ
+
+`scripts/` のシェルスクリプトを cron から叩く。スクリプトはリポジトリ直下に移動してから
+実行するので、cron 側で `cd` は要らない。ログの行き先は cron 側で決める。
+
+```cron
+0 4 * * 0 /home/pi/kabu-app/scripts/weekly_jpx_stocks.sh 2>&1 | /usr/bin/logger -t kabu-jpx
+```
+
+```bash
+journalctl -t kabu-jpx -n 50
+```
+
+| スクリプト | 頻度 | 内容 |
+| --- | --- | --- |
+| `weekly_jpx_stocks.sh` | 毎週日曜 04:00 | JPX 銘柄一覧 |
+
+JPX の一覧は月次更新のデータを週次で叩く。冪等なので、更新されていなければ DB も
+生ファイルも変わらない。1 回失敗しても次の週に入るため、取りこぼしに気づかないまま
+1 か月進むことがない。
+
+systemd timer は使わない。ログは `logger` で journald に入り、多重起動は `flock` で
+防げる。実行順の制御が要るジョブが増えたら考え直す。
 
 ## 開発
 

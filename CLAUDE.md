@@ -16,7 +16,7 @@ vault からこのリポジトリの実装ファイルへリンクは張らな�
 
 ## 実装の約束
 
-- データのパスをコードに埋めない。`KABU_DATA_DIR` で受ける (Mac は `kabu-terminal/data`、ラズパイは `/mnt/usb/data`)
-- Mac 側の `data` は SMB の読み取り専用マウント。書き込む処理を Mac で動かさない
-- バッチは systemd timer で回し、冪等に作る。同じ日に 2 回走っても壊れないこと
+- データのパスをコードに埋めない。`KABU_DATA_DIR` で受ける (Mac は `kabu-app/.data`、ラズパイは `/mnt/usb/data`)
+- `kabu-terminal/data` は SMB の読み取り専用マウント。`KABU_DATA_DIR` に指定しない。参照だけに使う
+- バッチは `scripts/` のシェルスクリプトを cron から叩く。冪等に作り、同じ日に 2 回走っても壊れないこと
 - PostgreSQL への接続はロールを使い分ける。バッチは `kabu_app` (localhost のみ)、開発は `kabu_dev`
