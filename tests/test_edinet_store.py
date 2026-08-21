@@ -6,20 +6,17 @@
 from dataclasses import replace
 from datetime import date, datetime
 
-import pytest
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from kabu_app.collectors.edinet import EdinetDocumentMeta
-from kabu_app.models import EdinetDocument, Stock
+from kabu_app.models import EdinetDocument
 from kabu_app.stores.edinet import (
     latest_submit_date,
     load_documents,
     mark_downloaded,
     pending_documents,
 )
-
-LISTED_CODES = ("2168", "9278")
 
 _BASE = EdinetDocumentMeta(
     doc_id="S100YW7F",
@@ -38,42 +35,13 @@ _BASE = EdinetDocumentMeta(
 )
 
 
-@pytest.fixture
-def session(session: Session) -> Session:
-    """conftest のセッションに上場銘柄を入れて渡す.
-
-    edinet_documents.code は stocks を参照するので、先に銘柄が無いと入らない。
-    """
-    session.add_all(_stock(code) for code in LISTED_CODES)
-    session.flush()
-    return session
-
-
-def _stock(code: str) -> Stock:
-    return Stock(
-        code=code,
-        name=f"銘柄{code}",
-        market_segment="prime",
-        industry33_code="0050",
-        industry33_name="水産・農林業",
-        industry17_code="01",
-        industry17_name="食品",
-        topix_scale_code=None,
-        topix_scale_name=None,
-        base_date=date(2026, 7, 31),
-        is_listed=True,
-    )
-
-
 def _meta(**overrides: object) -> EdinetDocumentMeta:
     return replace(_BASE, **overrides)  # type: ignore[arg-type]
 
 
 def test_書類を取り込む(session: Session) -> None:
-    result = load_documents(session, [_meta()])
+    assert load_documents(session, [_meta()]) == 1
 
-    assert result.saved == 1
-    assert result.unknown == 0
     document = session.get(EdinetDocument, "S100YW7F")
     assert document is not None
     assert document.code == "2168"
@@ -81,13 +49,16 @@ def test_書類を取り込む(session: Session) -> None:
     assert document.downloaded_at is None
 
 
-def test_銘柄マスタに無いコードは捨てる(session: Session) -> None:
-    """上場前や、JPX 一覧を取り始める前に上場廃止した会社がこれに当たる."""
-    result = load_documents(session, [_meta(), _meta(doc_id="S100XXXX", code="9999")])
+def test_銘柄マスタに無いコードも取り込む(session: Session) -> None:
+    """上場廃止した会社の有報を捨てると、過去の評価に生存者バイアスが入る.
 
-    assert result.saved == 1
-    assert result.unknown == 1
-    assert session.get(EdinetDocument, "S100XXXX") is None
+    stocks は JPX の最新一覧から作るので、買収や MBO で消えた会社は載らない。
+    """
+    assert load_documents(session, [_meta(doc_id="S100XXXX", code="7732")]) == 1
+
+    document = session.get(EdinetDocument, "S100XXXX")
+    assert document is not None
+    assert document.code == "7732"
 
 
 def test_同じ書類を2回入れても1行のまま(session: Session) -> None:

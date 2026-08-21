@@ -123,7 +123,7 @@ def fetch_edinet(
         if start > end:
             raise typer.BadParameter(f"開始日 {start} が終了日 {end} より後になっています")
 
-        saved, unknown = _collect_metadata(session, start, end, api_key)
+        saved = _collect_metadata(session, start, end, api_key)
 
         if skip_download:
             logger.info(
@@ -136,12 +136,10 @@ def fetch_edinet(
         )
 
     logger.info(
-        "完了: %s 〜 %s / メタデータ %d 件 (対象外 %d 件)"
-        " / ZIP 取得 %d 件 (既存 %d 件, 失敗 %d 件)",
+        "完了: %s 〜 %s / メタデータ %d 件 / ZIP 取得 %d 件 (既存 %d 件, 失敗 %d 件)",
         start,
         end,
         saved,
-        unknown,
         downloaded,
         reused,
         failed,
@@ -166,28 +164,26 @@ def _resolve_start_date(session: Session, from_date: str | None) -> date:
     return latest
 
 
-def _collect_metadata(session: Session, start: date, end: date, api_key: str) -> tuple[int, int]:
+def _collect_metadata(session: Session, start: date, end: date, api_key: str) -> int:
     """期間を 1 日ずつ舐めて書類メタデータを取り込む."""
     logger.info("書類一覧を取得: %s 〜 %s (%d 日)", start, end, (end - start).days + 1)
 
     saved = 0
-    unknown = 0
     target = start
     while target <= end:
         metas = fetch_document_list(target, api_key)
-        result = load_documents(session, metas)
+        count = load_documents(session, metas)
         session.commit()
 
-        if result.saved:
-            logger.info("%s: %d 件", target, result.saved)
-        saved += result.saved
-        unknown += result.unknown
+        if count:
+            logger.info("%s: %d 件", target, count)
+        saved += count
 
         target += timedelta(days=1)
         if target <= end:
             time.sleep(REQUEST_INTERVAL)
 
-    return saved, unknown
+    return saved
 
 
 def _download_pending(

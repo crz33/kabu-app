@@ -2,7 +2,7 @@
 
 from datetime import date, datetime
 
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Index, String
+from sqlalchemy import Boolean, Date, DateTime, Index, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from kabu_app.models.base import Base, TimestampMixin
@@ -14,6 +14,9 @@ class EdinetDocument(Base, TimestampMixin):
     今は有価証券報告書 (120) と訂正有価証券報告書 (130) だけを入れる。
     対象を広げるときは ``collectors.edinet.TARGET_DOC_TYPES`` に足す。
     DB 側に制約は置いていない。既存行を消さずに種別を増やせるようにするため。
+
+    ``code`` に stocks への外部キーは張らない。上場廃止した会社の有報も残すため。
+    上場中の銘柄に絞りたい分析は stocks と結合する。
     """
 
     __tablename__ = "edinet_documents"
@@ -36,9 +39,8 @@ class EdinetDocument(Base, TimestampMixin):
     )
     code: Mapped[str] = mapped_column(
         String(5),
-        ForeignKey("stocks.code", ondelete="RESTRICT"),
         nullable=False,
-        comment="JPX 銘柄コード。sec_code の末尾 0 を落としたもの",
+        comment="JPX 銘柄コード。sec_code の末尾 0 を落としたもの。上場廃止した銘柄も入る",
     )
     doc_type_code: Mapped[str] = mapped_column(
         String(3), nullable=False, comment="書類種別コード (120: 有報 / 130: 訂正有報)"
