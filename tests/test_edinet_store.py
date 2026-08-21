@@ -147,3 +147,10 @@ def test_取り込み上限を指定できる(session: Session) -> None:
     load_documents(session, [_meta(doc_id=f"S100000{index}") for index in range(3)])
 
     assert len(pending_documents(session, limit=2)) == 2
+
+
+def test_一覧に同じ書類が2回出ても落ちない(session: Session) -> None:
+    """EDINET は同じレコードを 2 行返すことがある。2025-06-10 の S100VWD9 がこれ."""
+    assert load_documents(session, [_meta(), _meta()]) == 1
+
+    assert session.execute(select(func.count()).select_from(EdinetDocument)).scalar_one() == 1

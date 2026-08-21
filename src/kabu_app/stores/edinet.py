@@ -52,7 +52,13 @@ def load_documents(session: Session, metas: Sequence[EdinetDocumentMeta]) -> int
     if not metas:
         return 0
 
-    for chunk in _chunked([asdict(meta) for meta in metas]):
+    # EDINET は同じ書類を 2 行返すことがある。そのまま upsert すると、ON CONFLICT DO UPDATE
+    # が同じ行を 2 度更新しようとして落ちる。
+    unique = list({meta.doc_id: meta for meta in metas}.values())
+    if len(unique) != len(metas):
+        logger.debug("一覧に重複していた書類を %d 件まとめた", len(metas) - len(unique))
+
+    for chunk in _chunked([asdict(meta) for meta in unique]):
         statement = insert(EdinetDocument).values(list(chunk))
         statement = statement.on_conflict_do_update(
             index_elements=[EdinetDocument.doc_id],
@@ -65,7 +71,7 @@ def load_documents(session: Session, metas: Sequence[EdinetDocumentMeta]) -> int
         session.execute(statement)
 
     session.flush()
-    return len(metas)
+    return len(unique)
 
 
 def pending_documents(session: Session, limit: int | None = None) -> Sequence[EdinetDocument]:
