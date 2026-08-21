@@ -433,8 +433,12 @@ def fetch_ticks(
     ] = None,
     only_jumps: Annotated[
         bool,
-        typer.Option("--only-jumps", help="終値が大きく飛んでいる銘柄だけを対象にする"),
+        typer.Option("--only-jumps", help="調整後終値が大きく飛んでいる銘柄だけを対象にする"),
     ] = False,
+    max_codes: Annotated[
+        int | None,
+        typer.Option("--max-codes", help="1 回の実行で扱う銘柄数の上限。遡るときに小分けする"),
+    ] = None,
 ) -> None:
     """Yahoo Finance から日次の株価を取得する.
 
@@ -446,6 +450,10 @@ def fetch_ticks(
 
     with session_scope(create_session_factory(settings.database_url)) as session:
         targets = _resolve_tick_targets(session, codes, only_jumps)
+        if max_codes is not None and len(targets) > max_codes:
+            # 遡るときは 1 銘柄で何十ページも叩くため、まとめて流すと Yahoo に締められる。
+            logger.info("%d 銘柄のうち先頭 %d 件だけ扱う", len(targets), max_codes)
+            targets = targets[:max_codes]
         default_start = date.fromisoformat(from_date) if from_date is not None else None
         previous = {} if default_start is not None else latest_prices(session)
 
