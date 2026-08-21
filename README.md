@@ -131,6 +131,7 @@ uv run alembic upgrade head --sql    # DB に触らず SQL を確認
 | `stock_snapshots` | JPX 一覧の基準日ごとの全銘柄。市場変更や業種変更を後から追うため |
 | `edinet_documents` | EDINET の有報・訂正有報のメタデータ。ZIP の取得状況も持つ。上場廃止した銘柄も入る |
 | `tdnet_disclosures` | TDnet の決算短信・訂正短信のメタデータ。実体の取得状況も持つ |
+| `ticks` | 日次の四本値と出来高。調整後終値も持つ。市場指数も同じ表に入る |
 
 JPX の銘柄一覧 (`data_j.xls`) には `日付` 列があり、これが基準日になる。JPX は月末時点のデータを 1 か月ほど遅れて公開するため、取得日とは一致しない。`stock_snapshots.base_date` にはこの `日付` 列を使う。
 
@@ -223,6 +224,53 @@ FINDOCGEN_DATABASE_URL="$(grep '^DATABASE_URL=' ~/findocgen/.env | cut -d= -f2-)
 移した行は `sec_code` `markets` `xbrl_file` が NULL になる。findocgen が持っていない列
 だから。`downloaded_at` は埋まるので、実体を落とし直そうとはしない。
 
+## 株価
+
+Yahoo Finance の株価時系列ページから日次の四本値を取る。API は無いので HTML を読む。中身は
+Next.js の RSC ペイロードに JSON で載っているため、DOM ではなくそちらを解く。
+
+```bash
+uv run kabu fetch ticks                          # 銘柄ごとに最新取引日の翌日から
+uv run kabu fetch ticks --from 2024-01-04        # 全銘柄をその日から取り直す
+uv run kabu fetch ticks --codes 7203,6758        # 銘柄を絞る
+uv run kabu fetch ticks --only-jumps             # 終値が飛んでいる銘柄だけ
+```
+
+1 ページ 20 営業日。リクエストの間を 2 秒空ける。上場中の全銘柄で 2 時間かかるので、
+バッチは週次にしてある。上場廃止すると Yahoo からページごと消えるため、対象は
+`stocks.is_listed` が true の銘柄に限る。廃止前の株価は取り込み済みのぶんが残る。
+
+### 調整後終値を必ず持つ
+
+ページの 1 行は 8 つの値を持つ。始値・高値・安値・終値・出来高・**調整後終値**・PER・PBR。
+PER と PBR は直近の日にしか入らないので使わない。
+
+調整後終値は株式分割を遡って調整した値。これを持たないとバックテストが壊れる。前身の
+findocgen は捨てていて、234 万行のうち **590 か所・561 銘柄**に「前日比 45% 以上の飛び」が
+残っていた。全部が分割で、実際には起きていない暴落になる。分割するのは株価が上がった会社が
+多いので、成績が体系的に甘くなる。
+
+始値・高値・安値の調整値は提供されない。`adjusted_close / close` を掛けて揃える。
+
+分割が起きると Yahoo は過去まで書き換える。差分だけ取っていると古い値が残るので、飛びが出た
+銘柄は全期間を取り直す。
+
+```bash
+uv run kabu fetch ticks --only-jumps --from 2024-01-04
+```
+
+### findocgen からのデータ移行
+
+234 万行あるので psql の COPY で流す。`ticks` が空のときだけ実行できる。
+
+```bash
+FINDOCGEN_DATABASE_URL="$(grep '^DATABASE_URL=' ~/findocgen/.env | cut -d= -f2-)" \
+  ./scripts/import_findocgen_ticks.sh
+```
+
+移した行は `adjusted_close` が NULL になる。分割のあった 561 銘柄は上のコマンドで取り直す。
+残りは分割していないので `close` をそのまま調整後とみなせる。
+
 ## バッチ
 
 `scripts/` のシェルスクリプトを cron から叩く。スクリプトはリポジトリ直下に移動してから
@@ -238,6 +286,7 @@ FINDOCGEN_DATABASE_URL="$(grep '^DATABASE_URL=' ~/findocgen/.env | cut -d= -f2-)
 journalctl -t kabu-jpx -n 50
 journalctl -t kabu-edinet -n 50
 journalctl -t kabu-tdnet -n 50
+journalctl -t kabu-ticks -n 50
 ```
 
 | スクリプト | 頻度 | 内容 |
@@ -245,6 +294,7 @@ journalctl -t kabu-tdnet -n 50
 | `weekly_jpx_stocks.sh` | 毎週日曜 04:00 | JPX 銘柄一覧 |
 | `daily_edinet.sh` | 毎日 22:00 | EDINET の有報・訂正有報 |
 | `daily_tdnet.sh` | 毎日 02:00 | TDnet の決算短信・訂正短信 |
+| `weekly_ticks.sh` | 毎週土曜 05:00 | Yahoo Finance の日次株価 |
 
 JPX の一覧は月次更新のデータを週次で叩く。冪等なので、更新されていなければ DB も
 生ファイルも変わらない。1 回失敗しても次の週に入るため、取りこぼしに気づかないまま

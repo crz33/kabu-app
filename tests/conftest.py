@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from kabu_app.config import get_settings
 from kabu_app.db import create_db_engine
-from kabu_app.models import EdinetDocument, Stock, StockSnapshot, TdnetDisclosure
+from kabu_app.models import EdinetDocument, Stock, StockSnapshot, TdnetDisclosure, Tick
 
 
 @pytest.fixture
@@ -29,6 +29,7 @@ def session() -> Iterator[Session]:
     session = Session(bind=connection, join_transaction_mode="create_savepoint")
     session.execute(delete(EdinetDocument))
     session.execute(delete(TdnetDisclosure))
+    session.execute(delete(Tick))
     session.execute(delete(StockSnapshot))
     session.execute(delete(Stock))
     try:

@@ -24,6 +24,8 @@ from kabu_app.collectors.tdnet import (
     download_file,
     fetch_disclosure_list,
 )
+from kabu_app.collectors.yahoo import REQUEST_INTERVAL as YAHOO_REQUEST_INTERVAL
+from kabu_app.collectors.yahoo import YahooPageError, fetch_quotes
 from kabu_app.config import get_settings
 from kabu_app.db import create_session_factory, session_scope
 from kabu_app.stores.edinet import (
@@ -40,6 +42,7 @@ from kabu_app.stores.tdnet import (
     pending_disclosures,
 )
 from kabu_app.stores.tdnet import mark_downloaded as mark_tdnet_downloaded
+from kabu_app.stores.tick import codes_with_price_jumps, latest_dates, listed_codes, save_quotes
 
 logger = logging.getLogger("kabu_app")
 
@@ -405,3 +408,98 @@ def _download_pending_disclosures(
             logger.info("開示 %d / %d 件", index, len(pending))
 
     return downloaded, reused, failed
+
+
+@fetch_app.command("ticks")
+def fetch_ticks(
+    from_date: Annotated[
+        str | None,
+        typer.Option("--from", help="取得開始日 (YYYY-MM-DD)。省略時は銘柄ごとの最新取引日の翌日"),
+    ] = None,
+    to_date: Annotated[
+        str | None,
+        typer.Option("--to", help="取得終了日 (YYYY-MM-DD)。省略時は今日"),
+    ] = None,
+    codes: Annotated[
+        str | None,
+        typer.Option("--codes", help="銘柄コードをカンマ区切りで指定する。省略時は上場中の全銘柄"),
+    ] = None,
+    only_jumps: Annotated[
+        bool,
+        typer.Option("--only-jumps", help="終値が大きく飛んでいる銘柄だけを対象にする"),
+    ] = False,
+) -> None:
+    """Yahoo Finance から日次の株価を取得する.
+
+    1 ページ 20 営業日で、リクエストの間は 2 秒空ける。上場中の全銘柄を 1 年ぶん遡ると
+    半日では終わらない。日々の更新は --from を省いて差分だけ取る。
+    """
+    settings = get_settings()
+    end = date.fromisoformat(to_date) if to_date else date.today()
+
+    with session_scope(create_session_factory(settings.database_url)) as session:
+        targets = _resolve_tick_targets(session, codes, only_jumps)
+        starts = {} if from_date is not None else latest_dates(session)
+        default_start = date.fromisoformat(from_date) if from_date is not None else None
+
+        logger.info("株価を取得: %d 銘柄 / 終了日 %s", len(targets), end)
+        saved, failed = _collect_ticks(session, targets, starts, default_start, end)
+
+    logger.info("完了: %d 件保存 / 取得できなかった銘柄 %d 件", saved, failed)
+
+
+def _resolve_tick_targets(session: Session, codes: str | None, only_jumps: bool) -> list[str]:
+    """取得する銘柄を決める."""
+    if codes is not None:
+        return [code.strip() for code in codes.split(",") if code.strip()]
+    if only_jumps:
+        jumps = codes_with_price_jumps(session)
+        logger.info("終値が飛んでいる銘柄が %d 件", len(jumps))
+        return jumps
+    return listed_codes(session)
+
+
+def _collect_ticks(
+    session: Session,
+    targets: list[str],
+    starts: dict[str, date],
+    default_start: date | None,
+    end: date,
+) -> tuple[int, int]:
+    """銘柄ごとに株価を取ってページ単位で書き込む."""
+    saved = 0
+    failed = 0
+    consecutive_failures = 0
+
+    for index, code in enumerate(targets, start=1):
+        start = default_start if default_start is not None else _next_day(starts.get(code))
+        if start > end:
+            continue
+
+        try:
+            for page in fetch_quotes(code, start, end):
+                saved += save_quotes(session, page)
+                session.commit()
+                time.sleep(YAHOO_REQUEST_INTERVAL)
+        except (YahooPageError, httpx.HTTPError) as error:
+            failed += 1
+            consecutive_failures += 1
+            logger.warning("%s の取得に失敗: %s", code, error)
+            if consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+                logger.error("%d 件続けて失敗したため中断する", consecutive_failures)
+                break
+            continue
+
+        consecutive_failures = 0
+        if index % 100 == 0:
+            logger.info("%d / %d 銘柄 (%d 件保存)", index, len(targets), saved)
+        time.sleep(YAHOO_REQUEST_INTERVAL)
+
+    return saved, failed
+
+
+def _next_day(latest: date | None) -> date:
+    """差分取得の開始日. 取り込みが無い銘柄は 1 年前から取る."""
+    if latest is None:
+        return date.today() - timedelta(days=365)
+    return latest + timedelta(days=1)
