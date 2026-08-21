@@ -3,6 +3,7 @@
 import logging
 import time
 from datetime import date, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Annotated
 
@@ -42,7 +43,13 @@ from kabu_app.stores.tdnet import (
     pending_disclosures,
 )
 from kabu_app.stores.tdnet import mark_downloaded as mark_tdnet_downloaded
-from kabu_app.stores.tick import codes_with_price_jumps, latest_dates, listed_codes, save_quotes
+from kabu_app.stores.tick import (
+    codes_with_price_jumps,
+    earliest_dates,
+    latest_prices,
+    listed_codes,
+    save_quotes,
+)
 
 logger = logging.getLogger("kabu_app")
 
@@ -439,11 +446,14 @@ def fetch_ticks(
 
     with session_scope(create_session_factory(settings.database_url)) as session:
         targets = _resolve_tick_targets(session, codes, only_jumps)
-        starts = {} if from_date is not None else latest_dates(session)
         default_start = date.fromisoformat(from_date) if from_date is not None else None
+        previous = {} if default_start is not None else latest_prices(session)
 
         logger.info("株価を取得: %d 銘柄 / 終了日 %s", len(targets), end)
-        saved, failed = _collect_ticks(session, targets, starts, default_start, end)
+        saved, failed, splits = _collect_ticks(session, targets, previous, default_start, end)
+
+        if splits:
+            saved += _refetch_split_codes(session, splits, end)
 
     logger.info("完了: %d 件保存 / 取得できなかった銘柄 %d 件", saved, failed)
 
@@ -454,7 +464,7 @@ def _resolve_tick_targets(session: Session, codes: str | None, only_jumps: bool)
         return [code.strip() for code in codes.split(",") if code.strip()]
     if only_jumps:
         jumps = codes_with_price_jumps(session)
-        logger.info("終値が飛んでいる銘柄が %d 件", len(jumps))
+        logger.info("調整後終値が飛んでいる銘柄が %d 件", len(jumps))
         return jumps
     return listed_codes(session)
 
@@ -462,26 +472,27 @@ def _resolve_tick_targets(session: Session, codes: str | None, only_jumps: bool)
 def _collect_ticks(
     session: Session,
     targets: list[str],
-    starts: dict[str, date],
+    previous: dict[str, tuple[date, Decimal]],
     default_start: date | None,
     end: date,
-) -> tuple[int, int]:
-    """銘柄ごとに株価を取ってページ単位で書き込む."""
+) -> tuple[int, int, list[str]]:
+    """銘柄ごとに株価を取ってページ単位で書き込む.
+
+    戻りは (保存件数, 取得できなかった銘柄数, 分割を検出した銘柄)。
+    """
     saved = 0
     failed = 0
+    splits: list[str] = []
     consecutive_failures = 0
 
     for index, code in enumerate(targets, start=1):
-        start = default_start if default_start is not None else _next_day(starts.get(code))
+        watch = previous.get(code) if default_start is None else None
+        start = default_start if default_start is not None else _overlap_start(watch)
         if start > end:
             continue
 
         try:
-            for page in fetch_quotes(code, start, end):
-                saved += save_quotes(session, page)
-                session.commit()
-                # ページを取った直後に空ける。これが次の銘柄の 1 ページ目との間隔にもなる。
-                time.sleep(YAHOO_REQUEST_INTERVAL)
+            count, split = _fetch_one_code(session, code, start, end, watch)
         except (YahooPageError, httpx.HTTPError) as error:
             failed += 1
             consecutive_failures += 1
@@ -491,15 +502,77 @@ def _collect_ticks(
                 break
             continue
 
+        saved += count
         consecutive_failures = 0
+        if split:
+            splits.append(code)
         if index % 100 == 0:
             logger.info("%d / %d 銘柄 (%d 件保存)", index, len(targets), saved)
 
-    return saved, failed
+    return saved, failed, splits
 
 
-def _next_day(latest: date | None) -> date:
-    """差分取得の開始日. 取り込みが無い銘柄は 1 年前から取る."""
-    if latest is None:
+def _fetch_one_code(
+    session: Session,
+    code: str,
+    start: date,
+    end: date,
+    watch: tuple[date, Decimal] | None,
+) -> tuple[int, bool]:
+    """1 銘柄を取り込む. 戻りは (保存件数, 分割を検出したか).
+
+    watch は「取り込み済みの最新取引日とその日の調整後終値」。同じ日をもう一度取って値が
+    変わっていれば、株式分割で過去まで書き換わったことになる。
+    """
+    saved = 0
+    split = False
+
+    for page in fetch_quotes(code, start, end):
+        if watch is not None:
+            watched_date, watched_price = watch
+            split = split or any(
+                quote.date == watched_date and quote.adjusted_close != watched_price
+                for quote in page
+            )
+        saved += save_quotes(session, page)
+        session.commit()
+        # ページを取った直後に空ける。これが次の銘柄の 1 ページ目との間隔にもなる。
+        time.sleep(YAHOO_REQUEST_INTERVAL)
+
+    return saved, split
+
+
+def _refetch_split_codes(session: Session, codes: list[str], end: date) -> int:
+    """株式分割を検出した銘柄を、取り込み済みの最古日まで遡って取り直す.
+
+    分割が起きると Yahoo は過去の調整後終値をすべて書き換える。差分だけ入れても、
+    それより前の行は古い水準のまま残ってしまう。
+    """
+    logger.info("株式分割を検出したので取り直す: %s", ", ".join(codes))
+    earliest = earliest_dates(session)
+
+    saved = 0
+    for code in codes:
+        start = earliest.get(code)
+        if start is None:
+            continue
+        try:
+            count, _ = _fetch_one_code(session, code, start, end, None)
+        except (YahooPageError, httpx.HTTPError) as error:
+            logger.warning("%s の取り直しに失敗: %s", code, error)
+            continue
+        saved += count
+        logger.info("%s を %s から取り直した (%d 件)", code, start, count)
+
+    return saved
+
+
+def _overlap_start(watch: tuple[date, Decimal] | None) -> date:
+    """差分取得の開始日. 最新取引日そのものから取り、1 日ぶん重ねる.
+
+    重ねるのは株式分割に気づくため。追加のリクエストは要らない。同じページに載っている。
+    取り込みが無い銘柄は 1 年前から取る。
+    """
+    if watch is None:
         return date.today() - timedelta(days=365)
-    return latest + timedelta(days=1)
+    return watch[0]

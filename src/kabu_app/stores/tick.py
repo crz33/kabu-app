@@ -7,6 +7,7 @@ import logging
 from collections.abc import Iterator, Sequence
 from dataclasses import asdict
 from datetime import date
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import func, select
@@ -28,9 +29,27 @@ adjusted_close を上書きするのが肝心。株式分割が起きると Yaho
 """
 
 
-def latest_dates(session: Session) -> dict[str, date]:
-    """銘柄ごとの最新取引日をまとめて引く. 差分取得の起点に使う."""
-    rows = session.execute(select(Tick.code, func.max(Tick.date)).group_by(Tick.code))
+def latest_prices(session: Session) -> dict[str, tuple[date, Decimal]]:
+    """銘柄ごとの最新取引日と、その日の調整後終値をまとめて引く.
+
+    差分取得はこの日から取り直して 1 日重ねる。重ねた日の調整後終値が変わっていれば、
+    株式分割で過去まで書き換わったと分かる。分割は過去の行を書き換えるので、翌日から
+    取っていては永久に気づけない。
+
+    adjusted_close が NULL の行は close で代用する。findocgen から移した行がこれに当たる。
+    """
+    price = func.coalesce(Tick.adjusted_close, Tick.close)
+    statement = (
+        select(Tick.code, Tick.date, price)
+        .distinct(Tick.code)
+        .order_by(Tick.code, Tick.date.desc())
+    )
+    return {code: (traded_on, value) for code, traded_on, value in session.execute(statement)}
+
+
+def earliest_dates(session: Session) -> dict[str, date]:
+    """銘柄ごとの最古の取引日. 分割を検出した銘柄を取り直す起点に使う."""
+    rows = session.execute(select(Tick.code, func.min(Tick.date)).group_by(Tick.code))
     # Result そのものを dict() に渡すと keys() があるせいで Mapping 扱いになる。
     return dict(rows.tuples().all())
 
@@ -72,20 +91,24 @@ def save_quotes(session: Session, quotes: Sequence[DailyQuote]) -> int:
 
 
 def codes_with_price_jumps(session: Session, threshold: float = 0.55) -> list[str]:
-    """終値が前日から大きく飛んでいる銘柄を返す.
+    """調整後終値が前日から大きく飛んでいる銘柄を返す.
 
-    株式分割や併合の跡。adjusted_close を持たずに取り込んだ行を洗い出すために使う。
-    実際の暴落と区別はつかないので、洗い直しの候補として見る。
+    見るのは close ではなく調整後の値。close は分割の日に必ず飛ぶが、それは正常な動き。
+    調整後が飛んでいるときだけ「調整が行き届いていない」ことになる。
+
+    adjusted_close が NULL の行は close で代用する。移した行と取り直した行を同じ式で
+    判定できる。実際の暴落や併合とは区別がつかないので、洗い直しの候補として見る。
     """
-    previous = func.lag(Tick.close).over(partition_by=Tick.code, order_by=Tick.date)
-    inner = select(Tick.code, Tick.close, previous.label("previous")).subquery()
+    price = func.coalesce(Tick.adjusted_close, Tick.close)
+    previous = func.lag(price).over(partition_by=Tick.code, order_by=Tick.date)
+    inner = select(Tick.code, price.label("price"), previous.label("previous")).subquery()
 
     statement = (
         select(inner.c.code)
         .where(
             inner.c.previous.is_not(None),
-            (inner.c.close < inner.c.previous * threshold)
-            | (inner.c.close > inner.c.previous / threshold),
+            (inner.c.price < inner.c.previous * threshold)
+            | (inner.c.price > inner.c.previous / threshold),
         )
         .distinct()
         .order_by(inner.c.code)

@@ -7,13 +7,15 @@ from dataclasses import replace
 from datetime import date
 from decimal import Decimal
 
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from kabu_app.collectors.yahoo import DailyQuote
 from kabu_app.models import Stock, Tick
 from kabu_app.stores.tick import (
     codes_with_price_jumps,
-    latest_dates,
+    earliest_dates,
+    latest_prices,
     listed_codes,
     save_quotes,
 )
@@ -62,7 +64,7 @@ def test_株価を取り込む(session: Session) -> None:
 def test_同じ日を2回入れても1行のまま(session: Session) -> None:
     save_quotes(session, [_quote(), _quote()])
 
-    assert len(latest_dates(session)) == 1
+    assert len(latest_prices(session)) == 1
 
 
 def test_取り直すと調整後終値が上がり直る(session: Session) -> None:
@@ -76,18 +78,39 @@ def test_取り直すと調整後終値が上がり直る(session: Session) -> N
     assert tick.adjusted_close == Decimal("783.00")
 
 
-def test_銘柄ごとの最新取引日を返す(session: Session) -> None:
+def test_銘柄ごとの最新取引日と調整後終値を返す(session: Session) -> None:
     """差分取得の起点に使う. 銘柄ごとに 1 回ずつ問い合わせない."""
     save_quotes(
         session,
         [
             _quote(date=date(2026, 8, 20)),
-            _quote(date=date(2026, 8, 21)),
+            _quote(date=date(2026, 8, 21), adjusted_close=Decimal("3132")),
             _quote(code="6758", date=date(2026, 8, 19)),
         ],
     )
 
-    assert latest_dates(session) == {"7203": date(2026, 8, 21), "6758": date(2026, 8, 19)}
+    assert latest_prices(session) == {
+        "7203": (date(2026, 8, 21), Decimal("3132.00")),
+        "6758": (date(2026, 8, 19), Decimal("3132.00")),
+    }
+
+
+def test_調整後終値が無ければ終値で代用する(session: Session) -> None:
+    """findocgen から移した行は adjusted_close が NULL のまま入っている."""
+    save_quotes(session, [_quote(adjusted_close=Decimal("3132"))])
+    session.execute(text("UPDATE ticks SET adjusted_close = NULL"))
+
+    assert latest_prices(session)["7203"] == (date(2026, 8, 21), Decimal("3132.00"))
+
+
+def test_銘柄ごとの最古の取引日を返す(session: Session) -> None:
+    """分割を検出した銘柄を取り直す起点に使う."""
+    save_quotes(
+        session,
+        [_quote(date=date(2026, 8, 20)), _quote(date=date(2026, 8, 21))],
+    )
+
+    assert earliest_dates(session) == {"7203": date(2026, 8, 20)}
 
 
 def test_上場中の銘柄だけを対象にする(session: Session) -> None:
@@ -98,8 +121,8 @@ def test_上場中の銘柄だけを対象にする(session: Session) -> None:
     assert listed_codes(session) == ["7203"]
 
 
-def test_終値が飛んでいる銘柄を洗い出す(session: Session) -> None:
-    """株式分割の跡。2961 は 6440 から 1555 に落ちていた."""
+def test_調整が行き届いていない銘柄を洗い出す(session: Session) -> None:
+    """2961 は 6440 から 1555 に落ちていた。調整後を持たない行がこう見える."""
     save_quotes(
         session,
         [
@@ -109,8 +132,32 @@ def test_終値が飛んでいる銘柄を洗い出す(session: Session) -> None
             _quote(code="7203", date=date(2026, 7, 30), close=Decimal("2950")),
         ],
     )
+    session.execute(text("UPDATE ticks SET adjusted_close = NULL"))
 
     assert codes_with_price_jumps(session) == ["2961"]
+
+
+def test_調整されていれば分割の日でも飛びとみなさない(session: Session) -> None:
+    """close は分割の日に必ず飛ぶ。それは正常な値なので拾ってはいけない."""
+    save_quotes(
+        session,
+        [
+            _quote(
+                code="2961",
+                date=date(2026, 7, 29),
+                close=Decimal("6440"),
+                adjusted_close=Decimal("1610"),
+            ),
+            _quote(
+                code="2961",
+                date=date(2026, 7, 30),
+                close=Decimal("1555"),
+                adjusted_close=Decimal("1555"),
+            ),
+        ],
+    )
+
+    assert codes_with_price_jumps(session) == []
 
 
 def test_併合で跳ね上がった銘柄も拾う(session: Session) -> None:
@@ -122,5 +169,6 @@ def test_併合で跳ね上がった銘柄も拾う(session: Session) -> None:
             _quote(code="1234", date=date(2026, 7, 30), close=Decimal("1000")),
         ],
     )
+    session.execute(text("UPDATE ticks SET adjusted_close = NULL"))
 
     assert codes_with_price_jumps(session) == ["1234"]
