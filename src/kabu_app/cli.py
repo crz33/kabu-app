@@ -302,7 +302,7 @@ def fetch_tdnet(
     if expired:
         logger.warning("期限切れで取れなくなった開示が %d 件ある", expired)
     logger.info(
-        "完了: %s 〜 %s / メタデータ %d 件 / 実体 %d 件 (既存 %d 件, 失敗 %d 件)",
+        "完了: %s 〜 %s / メタデータ %d 件 / ファイル %d 件取得 (既存 %d 件) / 失敗した開示 %d 件",
         start,
         end,
         saved,
@@ -351,7 +351,12 @@ def _collect_disclosures(session: Session, start: date, end: date) -> int:
 def _download_pending_disclosures(
     session: Session, data_dir: Path, horizon: date, max_download: int | None
 ) -> tuple[int, int, int]:
-    """実体が未取得の開示を落とす. XBRL があれば ZIP、無ければ PDF を取る."""
+    """実体が未取得の開示を落とす. PDF は必ず、XBRL はあるときだけ取る.
+
+    XBRL の無い決算短信が 1 割ほどある。中間決算短信に目立つ。PDF を常に落とすのは、
+    どの開示も同じ手順で読めるようにするため。ZIP しか無い開示があると、本文を読むのに
+    2 系統の処理が要る。findocgen の既存データも PDF と ZIP の両方を持っている。
+    """
     pending = pending_disclosures(session, horizon, limit=max_download)
     if not pending:
         return 0, 0, 0
@@ -363,28 +368,30 @@ def _download_pending_disclosures(
     failed = 0
     consecutive_failures = 0
 
-    for disclosure in pending:
-        # XBRL が無い決算短信もある。中間決算短信に目立つ。その場合は PDF が本体になる。
+    for index, disclosure in enumerate(pending, start=1):
+        sources = [(f"{disclosure.doc_id}.pdf", "pdf")]
         if disclosure.xbrl_file is not None:
-            source = disclosure.xbrl_file
-            suffix = "zip"
-        else:
-            source = f"{disclosure.doc_id}.pdf"
-            suffix = "pdf"
-        path = disclosure_path(data_dir, disclosure.doc_id, disclosure.disclosed_date, suffix)
+            sources.append((disclosure.xbrl_file, "zip"))
 
-        if path.exists():
-            mark_tdnet_downloaded(session, disclosure.doc_id)
-            session.commit()
-            reused += 1
-            continue
+        completed = True
+        for source, suffix in sources:
+            path = disclosure_path(data_dir, disclosure.doc_id, disclosure.disclosed_date, suffix)
+            if path.exists():
+                reused += 1
+                continue
+            try:
+                download_file(source, path)
+            except (httpx.HTTPError, OSError) as error:
+                logger.warning("%s の %s の取得に失敗: %s", disclosure.doc_id, suffix, error)
+                completed = False
+                break
+            downloaded += 1
+            time.sleep(TDNET_REQUEST_INTERVAL)
 
-        try:
-            download_file(source, path)
-        except (httpx.HTTPError, OSError) as error:
+        if not completed:
+            # 片方だけ落ちた開示は downloaded_at を埋めない。次の実行が残りを取りに行く。
             failed += 1
             consecutive_failures += 1
-            logger.warning("%s の取得に失敗: %s", disclosure.doc_id, error)
             if consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
                 logger.error("%d 件続けて失敗したため中断する", consecutive_failures)
                 break
@@ -392,11 +399,9 @@ def _download_pending_disclosures(
 
         mark_tdnet_downloaded(session, disclosure.doc_id)
         session.commit()
-        downloaded += 1
         consecutive_failures = 0
 
-        if downloaded % 100 == 0:
-            logger.info("実体 %d / %d 件", downloaded + reused, len(pending))
-        time.sleep(TDNET_REQUEST_INTERVAL)
+        if index % 100 == 0:
+            logger.info("開示 %d / %d 件", index, len(pending))
 
     return downloaded, reused, failed

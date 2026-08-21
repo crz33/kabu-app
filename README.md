@@ -197,12 +197,18 @@ EDINET と一番違うのはここ。一覧ページも実体ファイルも 31 
 
 ### XBRL が無い短信がある
 
-決算短信の 1 割ほどに XBRL が付かない。中間決算短信で目立つ。この場合は PDF が本体になる
-ので、PDF を落とす。XBRL があるときは ZIP だけを落とし、PDF は取らない。ZIP に
-`XBRLData/Attachment/qualitative.htm` が入っていて、定性情報まで読めるため。
+決算短信の 1 割ほどに XBRL が付かない。中間決算短信で目立つ。
 
-実体は `<KABU_DATA_DIR>/tdnet/YYYYMMDD/{docID}.zip` (または `.pdf`) に置く。findocgen と
-同じ配置なので、既存の 2 万件はそのまま使える。
+そこで **PDF は必ず落とし、XBRL があるときだけ ZIP も落とす**。ZIP しか無い開示があると、
+本文を読むのに 2 系統の処理が要る。同じ会社の短信を時系列で並べたときに読み方が変わるのが
+一番厄介なので、どの開示も PDF で読めるようにしてある。findocgen の既存 2 万件も両方持って
+いるので、そこと地続きになる。
+
+数値は ZIP から取る。`XBRLData/Summary` に iXBRL、`XBRLData/Attachment/qualitative.htm` に
+定性情報が入る。XBRL の無い 1 割は PDF から読むしかない。
+
+実体は `<KABU_DATA_DIR>/tdnet/YYYYMMDD/{docID}.pdf` と `.zip` に置く。findocgen と同じ配置
+なので、既存ぶんは落とし直さない。PDF は平均 471KB、年 9GB ほど増える。
 
 ### findocgen からのメタデータ移行
 
