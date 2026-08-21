@@ -6,8 +6,11 @@
 # 01:00 に始める。TDnet の開示は 23:55 まで出るので、日付が変わるまで待たないと当日ぶんを
 # 取りこぼす。所要は 10〜40 分。決算期の TDnet が重い日はもう少し伸びる。
 #
-# 株価はここに入れない。週次の weekly_ticks.sh が担当する。日足は 1 日 1 本しか増えないのに、
-# 毎晩やると Yahoo に週 26000 リクエスト投げることになるため。
+# 株価の差分取得はここに入れない。週次の weekly_ticks.sh が担当する。日足は 1 日 1 本しか
+# 増えないのに、毎晩やると Yahoo に週 26000 リクエスト投げることになるため。
+#
+# 入れてあるのは株式分割で調整が狂った銘柄の遡り。1 晩 50 銘柄に絞る。遡りは 1 銘柄で
+# 40 ページ近く叩くので、まとめて流すと締められる。対象が尽きれば 0 件で即座に終わる。
 #
 # JPX を先頭に置くのは、新しく上場した銘柄を stocks に入れてから EDINET を取るため。
 # 月次更新のデータだが冪等で数秒なので、順序を保証するほうを取る。
@@ -51,6 +54,7 @@ run() {
 run "JPX 銘柄一覧" uv run kabu fetch jpx-stocks
 run "EDINET"       uv run kabu fetch edinet
 run "TDnet"        uv run kabu fetch tdnet
+run "株価の遡り"    uv run kabu fetch ticks --only-jumps --from 2024-01-04 --max-codes 50
 
 if [ ${#failed[@]} -gt 0 ]; then
     echo "失敗した処理: ${failed[*]}" >&2
