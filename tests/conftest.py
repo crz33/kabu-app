@@ -3,21 +3,26 @@
 from collections.abc import Iterator
 
 import pytest
-from sqlalchemy import delete
+from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from kabu_app.config import get_settings
 from kabu_app.db import create_db_engine
-from kabu_app.models import EdinetDocument, Stock, StockSnapshot, TdnetDisclosure, Tick
+
+_TABLES = "stocks, stock_snapshots, edinet_documents, tdnet_disclosures, ticks"
+"""空にするテーブル。テーブルを足したらここにも足す.
+
+DELETE ではなく TRUNCATE を使う。ticks は 200 万行を超えるので、テストごとに全行を
+消して戻すと 1 件あたり数秒かかる。TRUNCATE ならトランザクション内で巻き戻せて速い。
+"""
 
 
 @pytest.fixture
 def session() -> Iterator[Session]:
     """空のテーブルを持つセッション。終了時にロールバックするので DB は元に戻る.
 
-    DB に繋げないときはスキップする。削除は外部キーに参照される側があとになるよう
-    並べてある。テーブルを足したらここにも足す。
+    DB に繋げないときはスキップする。
     """
     engine = create_db_engine(get_settings().database_url)
     try:
@@ -27,11 +32,7 @@ def session() -> Iterator[Session]:
 
     transaction = connection.begin()
     session = Session(bind=connection, join_transaction_mode="create_savepoint")
-    session.execute(delete(EdinetDocument))
-    session.execute(delete(TdnetDisclosure))
-    session.execute(delete(Tick))
-    session.execute(delete(StockSnapshot))
-    session.execute(delete(Stock))
+    session.execute(text(f"TRUNCATE TABLE {_TABLES} CASCADE"))
     try:
         yield session
     finally:
