@@ -160,3 +160,18 @@ def test_404は掛け直さない(monkeypatch: pytest.MonkeyPatch) -> None:
         _request(client, "https://example.test/", {"page": "1"})
 
     assert len(calls) == 1
+
+
+def test_期間を暦年ごとに切る() -> None:
+    """1 銘柄で何十ページも続けて叩くと Yahoo が 500 を返し始める."""
+    assert list(yahoo.iter_periods(date(2024, 1, 4), date(2026, 8, 21))) == [
+        (date(2024, 1, 4), date(2024, 12, 31)),
+        (date(2025, 1, 1), date(2025, 12, 31)),
+        (date(2026, 1, 1), date(2026, 8, 21)),
+    ]
+
+
+def test_同じ年に収まるなら切らない() -> None:
+    assert list(yahoo.iter_periods(date(2026, 8, 15), date(2026, 8, 21))) == [
+        (date(2026, 8, 15), date(2026, 8, 21))
+    ]

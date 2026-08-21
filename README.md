@@ -278,8 +278,38 @@ FINDOCGEN_DATABASE_URL="$(grep '^DATABASE_URL=' ~/findocgen/.env | cut -d= -f2-)
   ./scripts/import_findocgen_ticks.sh
 ```
 
-移した行は `adjusted_close` が NULL になる。分割のあった 561 銘柄は上のコマンドで取り直す。
+移した行は `adjusted_close` が NULL になる。分割のあった銘柄は上のコマンドで取り直す。
 残りは分割していないので `close` をそのまま調整後とみなせる。
+
+### 取り直しの進捗はどこにも記録しない
+
+`--only-jumps` が毎回 DB から対象を計算する。取り直した銘柄は正しい `adjusted_close` が
+入って飛びが消えるので、次から対象外になる。何回中断しても、同じコマンドを叩けば残りだけを
+処理する。件数を知りたいときはこれで足りる。
+
+```bash
+uv run python -c "
+from kabu_app.config import get_settings
+from kabu_app.db import create_session_factory, session_scope
+from kabu_app.stores.tick import codes_with_price_jumps
+with session_scope(create_session_factory(get_settings().database_url)) as s:
+    print(len(codes_with_price_jumps(s)))
+"
+```
+
+進捗を別に持たないのは、本体と食い違う余地を作らないため。ただし判定は前日比 45% という
+閾値に頼っているので、1.1 分割のような小さい分割は拾えない。
+
+### Yahoo は IP 単位で締める
+
+短時間に叩きすぎると 500 を返し始める。ブラウザからも返らなくなるので、UA や cookie の
+問題ではない。回復には数時間かかる。
+
+2026-08-21 に踏んだ。560 銘柄 x 32 ページ = 約 18000 リクエストを一度に流そうとして、23 分で
+締められた。findocgen が無傷だったのは、週次で 1 銘柄 1 ページ (3704 リクエストを 2 時間に
+分散) だったため。同じ 2 秒間隔でも 1 銘柄あたりのページ数が違うと密度がまるで変わる。
+
+遡って取り直すときは 50 銘柄ずつに区切る。1 回 1600 リクエストなら週次より軽い。
 
 ## バッチ
 
@@ -604,8 +634,38 @@ FINDOCGEN_DATABASE_URL="$(grep '^DATABASE_URL=' ~/findocgen/.env | cut -d= -f2-)
   ./scripts/import_findocgen_ticks.sh
 ```
 
-移した行は `adjusted_close` が NULL になる。分割のあった 561 銘柄は上のコマンドで取り直す。
+移した行は `adjusted_close` が NULL になる。分割のあった銘柄は上のコマンドで取り直す。
 残りは分割していないので `close` をそのまま調整後とみなせる。
+
+### 取り直しの進捗はどこにも記録しない
+
+`--only-jumps` が毎回 DB から対象を計算する。取り直した銘柄は正しい `adjusted_close` が
+入って飛びが消えるので、次から対象外になる。何回中断しても、同じコマンドを叩けば残りだけを
+処理する。件数を知りたいときはこれで足りる。
+
+```bash
+uv run python -c "
+from kabu_app.config import get_settings
+from kabu_app.db import create_session_factory, session_scope
+from kabu_app.stores.tick import codes_with_price_jumps
+with session_scope(create_session_factory(get_settings().database_url)) as s:
+    print(len(codes_with_price_jumps(s)))
+"
+```
+
+進捗を別に持たないのは、本体と食い違う余地を作らないため。ただし判定は前日比 45% という
+閾値に頼っているので、1.1 分割のような小さい分割は拾えない。
+
+### Yahoo は IP 単位で締める
+
+短時間に叩きすぎると 500 を返し始める。ブラウザからも返らなくなるので、UA や cookie の
+問題ではない。回復には数時間かかる。
+
+2026-08-21 に踏んだ。560 銘柄 x 32 ページ = 約 18000 リクエストを一度に流そうとして、23 分で
+締められた。findocgen が無傷だったのは、週次で 1 銘柄 1 ページ (3704 リクエストを 2 時間に
+分散) だったため。同じ 2 秒間隔でも 1 銘柄あたりのページ数が違うと密度がまるで変わる。
+
+遡って取り直すときは 50 銘柄ずつに区切る。1 回 1600 リクエストなら週次より軽い。
 
 ## バッチ
 
@@ -914,8 +974,38 @@ FINDOCGEN_DATABASE_URL="$(grep '^DATABASE_URL=' ~/findocgen/.env | cut -d= -f2-)
   ./scripts/import_findocgen_ticks.sh
 ```
 
-移した行は `adjusted_close` が NULL になる。分割のあった 561 銘柄は上のコマンドで取り直す。
+移した行は `adjusted_close` が NULL になる。分割のあった銘柄は上のコマンドで取り直す。
 残りは分割していないので `close` をそのまま調整後とみなせる。
+
+### 取り直しの進捗はどこにも記録しない
+
+`--only-jumps` が毎回 DB から対象を計算する。取り直した銘柄は正しい `adjusted_close` が
+入って飛びが消えるので、次から対象外になる。何回中断しても、同じコマンドを叩けば残りだけを
+処理する。件数を知りたいときはこれで足りる。
+
+```bash
+uv run python -c "
+from kabu_app.config import get_settings
+from kabu_app.db import create_session_factory, session_scope
+from kabu_app.stores.tick import codes_with_price_jumps
+with session_scope(create_session_factory(get_settings().database_url)) as s:
+    print(len(codes_with_price_jumps(s)))
+"
+```
+
+進捗を別に持たないのは、本体と食い違う余地を作らないため。ただし判定は前日比 45% という
+閾値に頼っているので、1.1 分割のような小さい分割は拾えない。
+
+### Yahoo は IP 単位で締める
+
+短時間に叩きすぎると 500 を返し始める。ブラウザからも返らなくなるので、UA や cookie の
+問題ではない。回復には数時間かかる。
+
+2026-08-21 に踏んだ。560 銘柄 x 32 ページ = 約 18000 リクエストを一度に流そうとして、23 分で
+締められた。findocgen が無傷だったのは、週次で 1 銘柄 1 ページ (3704 リクエストを 2 時間に
+分散) だったため。同じ 2 秒間隔でも 1 銘柄あたりのページ数が違うと密度がまるで変わる。
+
+遡って取り直すときは 50 銘柄ずつに区切る。1 回 1600 リクエストなら週次より軽い。
 
 ## バッチ
 

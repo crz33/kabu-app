@@ -26,7 +26,7 @@ from kabu_app.collectors.tdnet import (
     fetch_disclosure_list,
 )
 from kabu_app.collectors.yahoo import REQUEST_INTERVAL as YAHOO_REQUEST_INTERVAL
-from kabu_app.collectors.yahoo import YahooPageError, fetch_quotes
+from kabu_app.collectors.yahoo import YahooPageError, create_client, fetch_quotes, iter_periods
 from kabu_app.config import get_settings
 from kabu_app.db import create_session_factory, session_scope
 from kabu_app.stores.edinet import (
@@ -450,10 +450,12 @@ def fetch_ticks(
         previous = {} if default_start is not None else latest_prices(session)
 
         logger.info("株価を取得: %d 銘柄 / 終了日 %s", len(targets), end)
-        saved, failed, splits = _collect_ticks(session, targets, previous, default_start, end)
-
-        if splits:
-            saved += _refetch_split_codes(session, splits, end)
+        with create_client() as client:
+            saved, failed, splits = _collect_ticks(
+                session, client, targets, previous, default_start, end
+            )
+            if splits:
+                saved += _refetch_split_codes(session, client, splits, end)
 
     logger.info("完了: %d 件保存 / 取得できなかった銘柄 %d 件", saved, failed)
 
@@ -471,6 +473,7 @@ def _resolve_tick_targets(session: Session, codes: str | None, only_jumps: bool)
 
 def _collect_ticks(
     session: Session,
+    client: httpx.Client,
     targets: list[str],
     previous: dict[str, tuple[date, Decimal]],
     default_start: date | None,
@@ -492,7 +495,7 @@ def _collect_ticks(
             continue
 
         try:
-            count, split = _fetch_one_code(session, code, start, end, watch)
+            count, split = _fetch_one_code(session, client, code, start, end, watch)
         except (YahooPageError, httpx.HTTPError) as error:
             failed += 1
             consecutive_failures += 1
@@ -514,6 +517,7 @@ def _collect_ticks(
 
 def _fetch_one_code(
     session: Session,
+    client: httpx.Client,
     code: str,
     start: date,
     end: date,
@@ -521,28 +525,34 @@ def _fetch_one_code(
 ) -> tuple[int, bool]:
     """1 銘柄を取り込む. 戻りは (保存件数, 分割を検出したか).
 
+    期間は暦年ごとに区切って要求する。まとめて要求すると 1 銘柄で何十ページも続けて叩く
+    ことになり、Yahoo が 500 を返し始める。
+
     watch は「取り込み済みの最新取引日とその日の調整後終値」。同じ日をもう一度取って値が
     変わっていれば、株式分割で過去まで書き換わったことになる。
     """
     saved = 0
     split = False
 
-    for page in fetch_quotes(code, start, end):
-        if watch is not None:
-            watched_date, watched_price = watch
-            split = split or any(
-                quote.date == watched_date and quote.adjusted_close != watched_price
-                for quote in page
-            )
-        saved += save_quotes(session, page)
-        session.commit()
-        # ページを取った直後に空ける。これが次の銘柄の 1 ページ目との間隔にもなる。
-        time.sleep(YAHOO_REQUEST_INTERVAL)
+    for period_start, period_end in iter_periods(start, end):
+        for page in fetch_quotes(client, code, period_start, period_end):
+            if watch is not None:
+                watched_date, watched_price = watch
+                split = split or any(
+                    quote.date == watched_date and quote.adjusted_close != watched_price
+                    for quote in page
+                )
+            saved += save_quotes(session, page)
+            session.commit()
+            # ページを取った直後に空ける。これが次の銘柄の 1 ページ目との間隔にもなる。
+            time.sleep(YAHOO_REQUEST_INTERVAL)
 
     return saved, split
 
 
-def _refetch_split_codes(session: Session, codes: list[str], end: date) -> int:
+def _refetch_split_codes(
+    session: Session, client: httpx.Client, codes: list[str], end: date
+) -> int:
     """株式分割を検出した銘柄を、取り込み済みの最古日まで遡って取り直す.
 
     分割が起きると Yahoo は過去の調整後終値をすべて書き換える。差分だけ入れても、
@@ -557,7 +567,7 @@ def _refetch_split_codes(session: Session, codes: list[str], end: date) -> int:
         if start is None:
             continue
         try:
-            count, _ = _fetch_one_code(session, code, start, end, None)
+            count, _ = _fetch_one_code(session, client, code, start, end, None)
         except (YahooPageError, httpx.HTTPError) as error:
             logger.warning("%s の取り直しに失敗: %s", code, error)
             continue

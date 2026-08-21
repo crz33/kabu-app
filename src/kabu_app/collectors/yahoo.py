@@ -73,13 +73,26 @@ class DailyQuote:
     adjusted_close: Decimal
 
 
+def create_client(timeout: float = 30.0) -> httpx.Client:
+    """全銘柄で使い回すクライアントを作る.
+
+    銘柄ごとに作り直すと、そのたびに TCP と TLS を張り直すことになる。前身の findocgen は
+    1 つのクライアントを使い回していて、同じ Yahoo を叩きながら HTTP エラーがほぼ出て
+    いなかった。
+    """
+    return httpx.Client(headers={"User-Agent": _USER_AGENT}, timeout=timeout, follow_redirects=True)
+
+
 def fetch_quotes(
-    code: str, start: date, end: date, timeout: float = 30.0
+    client: httpx.Client, code: str, start: date, end: date
 ) -> Iterator[list[DailyQuote]]:
     """指定期間の日次株価をページごとに返す.
 
     ページ 1 が最新で、番号が増えるほど古くなる。呼び出し側はページごとに書き込めるので、
     途中で止まっても取れたぶんは残る。
+
+    期間を広く取ると 1 銘柄で何十ページも続けて叩くことになる。Yahoo が 500 を返し始める
+    ので、遡るときは ``iter_periods`` で区切ってから渡すこと。
 
     Raises:
         YahooPageError: ページの作りが変わって株価を取り出せなかった場合
@@ -93,27 +106,38 @@ def fetch_quotes(
     }
     url = YAHOO_HISTORY_URL.format(code=code)
 
-    with httpx.Client(
-        headers={"User-Agent": _USER_AGENT}, timeout=timeout, follow_redirects=True
-    ) as client:
-        total_pages = _MAX_PAGES
-        for page in range(1, _MAX_PAGES + 1):
-            response = _request(client, url, {**params, "page": str(page)})
-            histories, total_size = _extract_histories(response.content, code)
+    total_pages = _MAX_PAGES
+    for page in range(1, _MAX_PAGES + 1):
+        response = _request(client, url, {**params, "page": str(page)})
+        histories, total_size = _extract_histories(response.content, code)
 
-            if page == 1:
-                if total_size == 0:
-                    return
-                total_pages = min(-(-total_size // PAGE_SIZE), _MAX_PAGES)
-
-            quotes = [
-                quote for entry in histories if (quote := _build_quote(code, entry)) is not None
-            ]
-            if quotes:
-                yield quotes
-
-            if page >= total_pages:
+        if page == 1:
+            if total_size == 0:
                 return
+            total_pages = min(-(-total_size // PAGE_SIZE), _MAX_PAGES)
+
+        quotes = [quote for entry in histories if (quote := _build_quote(code, entry)) is not None]
+        if quotes:
+            yield quotes
+
+        if page >= total_pages:
+            return
+
+
+def iter_periods(start: date, end: date) -> Iterator[tuple[date, date]]:
+    """期間を暦年ごとに切って古い順に返す.
+
+    1 銘柄あたりの連続ページ数を抑えるため。2 年 8 か月をまとめて要求すると 32 ページに
+    なり、その途中で 500 が返り始める。findocgen は 1 年ずつ区切っていて 13 ページに
+    収まっていた。
+    """
+    year = start.year
+    while year <= end.year:
+        period_start = max(start, date(year, 1, 1))
+        period_end = min(end, date(year, 12, 31))
+        if period_start <= period_end:
+            yield period_start, period_end
+        year += 1
 
 
 def _request(client: httpx.Client, url: str, params: dict[str, str]) -> httpx.Response:
