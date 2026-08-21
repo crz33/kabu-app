@@ -97,13 +97,18 @@ sudo -u postgres psql -c "SELECT rule_number, type, database, user_name, address
 # ラズパイ
 DATABASE_URL=postgresql+psycopg://kabu_app:PASSWORD@localhost:5432/kabu
 KABU_DATA_DIR=/mnt/usb/data
+EDINET_API_KEY=<EDINET のサブスクリプションキー>
 
 # Mac
 DATABASE_URL=postgresql+psycopg://kabu_dev:PASSWORD@<ラズパイのIP>:5432/kabu
 KABU_DATA_DIR=./.data
+EDINET_API_KEY=<EDINET のサブスクリプションキー>
 ```
 
 ラズパイの IP は DHCP だと変わる。ルータ側で固定するか、mDNS 名を使う。
+
+EDINET のキーは https://api.edinet-fsa.go.jp/ で登録して発行する。Mac とラズパイで
+同じキーを使ってよい。
 
 ## マイグレーション
 
@@ -124,8 +129,45 @@ uv run alembic upgrade head --sql    # DB に触らず SQL を確認
 | --- | --- |
 | `stocks` | 銘柄マスタ。最新状態のみ。上場廃止は削除せず `is_listed = false` |
 | `stock_snapshots` | JPX 一覧の基準日ごとの全銘柄。市場変更や業種変更を後から追うため |
+| `edinet_documents` | EDINET の有報・訂正有報のメタデータ。ZIP の取得状況も持つ |
 
 JPX の銘柄一覧 (`data_j.xls`) には `日付` 列があり、これが基準日になる。JPX は月末時点のデータを 1 か月ほど遅れて公開するため、取得日とは一致しない。`stock_snapshots.base_date` にはこの `日付` 列を使う。
+
+## EDINET
+
+有価証券報告書 (`120`) と訂正有価証券報告書 (`130`) を取得する。証券コードを持つ提出者
+だけが対象で、銘柄マスタに無いコードは捨てる。非上場の会社やファンドも有報を出すため、
+一覧の 1 割ほどしか残らない。
+
+```bash
+uv run kabu fetch edinet                    # 前回の続きから今日まで
+uv run kabu fetch edinet --from 2025-01-06  # 開始日を指定する
+uv run kabu fetch edinet --skip-download    # メタデータだけ入れる
+uv run kabu fetch edinet --max-download 200 # ZIP の取得を 200 件で打ち切る
+```
+
+`--from` を省くと `edinet_documents` の最新提出日から取り直す。その日をもう一度引くのは、
+同じ日に後から提出された書類を拾うため。書類は `doc_id` で upsert するので重複しない。
+
+ZIP は `<KABU_DATA_DIR>/edinet/YYYYMMDD/{docID}.zip` に置く。既にファイルがあれば落とさず
+記録だけ付ける。取得に失敗した書類は `downloaded_at` が NULL のまま残り、次の実行が提出日に
+かかわらず拾い直す。取得済みの日を記録するテーブルは持たない。失敗した日を「済み」と
+書いてしまう事故のほうが、空振りの一覧取得より高くつくため。
+
+API キーは `EDINET_API_KEY` に入れる。キーが無効でも EDINET は HTTP 200 を返すので、本文の
+`StatusCode` を見て落とす。見落とすと「対象 0 件」で静かに完走してしまう。
+
+### 初回のバックフィル
+
+前身の findocgen が 2025-01-06 以降の ZIP を `/mnt/usb/data/edinet/` に残している。同じ配置を
+引き継ぐので、メタデータを入れ直せばファイルの再取得は起きない。
+
+```bash
+uv run kabu fetch edinet --from 2025-01-06
+```
+
+日数ぶんの一覧取得が走る。ZIP は既存ぶんを再利用し、findocgen が取っていなかった訂正有報
+だけが新しく落ちる。
 
 ## バッチ
 
@@ -133,16 +175,19 @@ JPX の銘柄一覧 (`data_j.xls`) には `日付` 列があり、これが基�
 実行するので、cron 側で `cd` は要らない。ログの行き先は cron 側で決める。
 
 ```cron
-0 4 * * 0 /home/pi/kabu-app/scripts/weekly_jpx_stocks.sh 2>&1 | /usr/bin/logger -t kabu-jpx
+0 4 * * 0 /home/takada/kabu-app/scripts/weekly_jpx_stocks.sh 2>&1 | /usr/bin/logger -t kabu-jpx
+0 22 * * * /home/takada/kabu-app/scripts/daily_edinet.sh      2>&1 | /usr/bin/logger -t kabu-edinet
 ```
 
 ```bash
 journalctl -t kabu-jpx -n 50
+journalctl -t kabu-edinet -n 50
 ```
 
 | スクリプト | 頻度 | 内容 |
 | --- | --- | --- |
 | `weekly_jpx_stocks.sh` | 毎週日曜 04:00 | JPX 銘柄一覧 |
+| `daily_edinet.sh` | 毎日 22:00 | EDINET の有報・訂正有報 |
 
 JPX の一覧は月次更新のデータを週次で叩く。冪等なので、更新されていなければ DB も
 生ファイルも変わらない。1 回失敗しても次の週に入るため、取りこぼしに気づかないまま

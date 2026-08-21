@@ -1,47 +1,20 @@
 """銘柄一覧の取り込みのテスト.
 
-実際の DB に繋いで動かす。書き込みはすべてトランザクション内で行い、
-テストの最後に必ずロールバックする。DB に繋げないときはスキップする。
+セッションは conftest のフィクスチャが用意する。テストの最後にロールバックされる。
 """
 
-from collections.abc import Iterator
 from datetime import date
 
-import pytest
-from sqlalchemy import delete, select
-from sqlalchemy.exc import OperationalError
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from kabu_app.collectors.jpx import JpxStock, JpxStockList
-from kabu_app.config import get_settings
-from kabu_app.db import create_db_engine
 from kabu_app.models import Stock, StockSnapshot
 from kabu_app.stores.stock import load_stock_list
 
 JUNE = date(2026, 6, 30)
 JULY = date(2026, 7, 31)
 MAY = date(2026, 5, 31)
-
-
-@pytest.fixture
-def session() -> Iterator[Session]:
-    """空のテーブルを持つセッション。終了時にロールバックするので DB は元に戻る."""
-    engine = create_db_engine(get_settings().database_url)
-    try:
-        connection = engine.connect()
-    except OperationalError as error:
-        pytest.skip(f"DB に接続できないためスキップ: {error}")
-
-    transaction = connection.begin()
-    session = Session(bind=connection, join_transaction_mode="create_savepoint")
-    session.execute(delete(StockSnapshot))
-    session.execute(delete(Stock))
-    try:
-        yield session
-    finally:
-        session.close()
-        transaction.rollback()
-        connection.close()
 
 
 def _stock(code: str) -> JpxStock:

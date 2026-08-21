@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     kabu_data_dir: Path
     """生データの置き場 (環境変数 KABU_DATA_DIR). Mac は ./.data、ラズパイは /mnt/usb/data."""
 
+    edinet_api_key: str | None = None
+    """EDINET API のサブスクリプションキー (環境変数 EDINET_API_KEY)."""
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
