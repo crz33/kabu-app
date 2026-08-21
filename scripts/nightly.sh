@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# 毎晩の取得をまとめて回す。JPX → EDINET → TDnet → 株価 の順。
+# 毎晩の取得をまとめて回す。JPX → EDINET → TDnet の順。
 #
 #   0 1 * * * /home/takada/kabu-app/scripts/nightly.sh 2>&1 | /usr/bin/logger -t kabu
 #
-# 01:00 に始める。TDnet の開示は 23:55 まで出るので日付が変わるまで待ち、Yahoo の 2 時間が
-# 朝までに終わる時刻に置いてある。所要は 2〜3 時間。決算期の TDnet が重い日はもう少し伸びる。
+# 01:00 に始める。TDnet の開示は 23:55 まで出るので、日付が変わるまで待たないと当日ぶんを
+# 取りこぼす。所要は 10〜40 分。決算期の TDnet が重い日はもう少し伸びる。
 #
-# JPX を先頭に置くのは、新しく上場した銘柄を stocks に入れてから EDINET と株価を取るため。
+# 株価はここに入れない。週次の weekly_ticks.sh が担当する。日足は 1 日 1 本しか増えないのに、
+# 毎晩やると Yahoo に週 26000 リクエスト投げることになるため。
+#
+# JPX を先頭に置くのは、新しく上場した銘柄を stocks に入れてから EDINET を取るため。
 # 月次更新のデータだが冪等で数秒なので、順序を保証するほうを取る。
 #
 # 途中で 1 つ落ちても後続は走らせる。TDnet は 31 日で消えるため、EDINET の失敗に
@@ -19,10 +22,11 @@ export PATH="$HOME/.local/bin:$PATH"
 # .env はカレントディレクトリから読まれる。リポジトリ直下に移ってから実行する。
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-# 多重起動を防ぐ。前の晩の実行がまだ終わっていなければ黙って抜ける。
+# 週次の株価取得と同じロックを使う。DB と回線を共有するので同時に走らせる意味がない。
+# 前の実行がまだ終わっていなければ黙って抜ける。次の晩に入り直せばよい。
 # macOS には flock が無い。手元でのデバッグを通すため、無ければロックを諦める。
 if command -v flock >/dev/null 2>&1; then
-    exec 9>"/tmp/kabu-nightly.lock"
+    exec 9>"/tmp/kabu.lock"
     if ! flock -n 9; then
         echo "前の実行がまだ動いているため抜ける" >&2
         exit 0
@@ -47,7 +51,6 @@ run() {
 run "JPX 銘柄一覧" uv run kabu fetch jpx-stocks
 run "EDINET"       uv run kabu fetch edinet
 run "TDnet"        uv run kabu fetch tdnet
-run "株価"          uv run kabu fetch ticks
 
 if [ ${#failed[@]} -gt 0 ]; then
     echo "失敗した処理: ${failed[*]}" >&2
