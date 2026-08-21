@@ -130,6 +130,7 @@ uv run alembic upgrade head --sql    # DB に触らず SQL を確認
 | `stocks` | 銘柄マスタ。最新状態のみ。上場廃止は削除せず `is_listed = false` |
 | `stock_snapshots` | JPX 一覧の基準日ごとの全銘柄。市場変更や業種変更を後から追うため |
 | `edinet_documents` | EDINET の有報・訂正有報のメタデータ。ZIP の取得状況も持つ。上場廃止した銘柄も入る |
+| `tdnet_disclosures` | TDnet の決算短信・訂正短信のメタデータ。実体の取得状況も持つ |
 
 JPX の銘柄一覧 (`data_j.xls`) には `日付` 列があり、これが基準日になる。JPX は月末時点のデータを 1 か月ほど遅れて公開するため、取得日とは一致しない。`stock_snapshots.base_date` にはこの `日付` 列を使う。
 
@@ -173,6 +174,49 @@ uv run kabu fetch edinet --from 2025-01-06
 日数ぶんの一覧取得が走る。ZIP は既存ぶんを再利用し、findocgen が取っていなかった訂正有報
 だけが新しく落ちる。
 
+## TDnet
+
+決算短信とその訂正を取得する。表題に「決算短信」を含む開示をすべて残す。「決算短信の
+発表日変更のお知らせ」のような短信そのものでない開示も混じるが、捨てずに入れる。実体を
+落とすかどうかは XBRL の有無で決める。
+
+```bash
+uv run kabu fetch tdnet                     # 前回の続きから今日まで
+uv run kabu fetch tdnet --from 2026-08-15   # 開始日を指定する
+uv run kabu fetch tdnet --skip-download     # メタデータだけ入れる
+```
+
+### 31 日で消える
+
+EDINET と一番違うのはここ。一覧ページも実体ファイルも 31 日ほどで消える。**取り逃した日は
+二度と取れない**。日次バッチを止めたまま 1 か月放置すると、その期間は永久に欠ける。
+
+未取得のリトライも 31 日以内に限っている。それより古いものは何度叩いても 404 が返るだけ
+なので、`pending_disclosures` が最初から対象にしない。取り逃した件数は実行の最後に警告で
+出る。数が増えていたらバッチが止まっている。
+
+### XBRL が無い短信がある
+
+決算短信の 1 割ほどに XBRL が付かない。中間決算短信で目立つ。この場合は PDF が本体になる
+ので、PDF を落とす。XBRL があるときは ZIP だけを落とし、PDF は取らない。ZIP に
+`XBRLData/Attachment/qualitative.htm` が入っていて、定性情報まで読めるため。
+
+実体は `<KABU_DATA_DIR>/tdnet/YYYYMMDD/{docID}.zip` (または `.pdf`) に置く。findocgen と
+同じ配置なので、既存の 2 万件はそのまま使える。
+
+### findocgen からのメタデータ移行
+
+過去分は TDnet から取り直せない。ZIP は `/mnt/usb/data/tdnet/` に 25773 件残っているが、
+メタデータは findocgen の PostgreSQL にしかない。1 度だけ移す。
+
+```bash
+FINDOCGEN_DATABASE_URL="$(grep '^DATABASE_URL=' ~/findocgen/.env | cut -d= -f2-)" \
+  ./scripts/import_findocgen_tdnet.sh
+```
+
+移した行は `sec_code` `markets` `xbrl_file` が NULL になる。findocgen が持っていない列
+だから。`downloaded_at` は埋まるので、実体を落とし直そうとはしない。
+
 ## バッチ
 
 `scripts/` のシェルスクリプトを cron から叩く。スクリプトはリポジトリ直下に移動してから
@@ -181,17 +225,20 @@ uv run kabu fetch edinet --from 2025-01-06
 ```cron
 0 4 * * 0 /home/takada/kabu-app/scripts/weekly_jpx_stocks.sh 2>&1 | /usr/bin/logger -t kabu-jpx
 0 22 * * * /home/takada/kabu-app/scripts/daily_edinet.sh      2>&1 | /usr/bin/logger -t kabu-edinet
+0  2 * * * /home/takada/kabu-app/scripts/daily_tdnet.sh       2>&1 | /usr/bin/logger -t kabu-tdnet
 ```
 
 ```bash
 journalctl -t kabu-jpx -n 50
 journalctl -t kabu-edinet -n 50
+journalctl -t kabu-tdnet -n 50
 ```
 
 | スクリプト | 頻度 | 内容 |
 | --- | --- | --- |
 | `weekly_jpx_stocks.sh` | 毎週日曜 04:00 | JPX 銘柄一覧 |
 | `daily_edinet.sh` | 毎日 22:00 | EDINET の有報・訂正有報 |
+| `daily_tdnet.sh` | 毎日 02:00 | TDnet の決算短信・訂正短信 |
 
 JPX の一覧は月次更新のデータを週次で叩く。冪等なので、更新されていなければ DB も
 生ファイルも変わらない。1 回失敗しても次の週に入るため、取りこぼしに気づかないまま

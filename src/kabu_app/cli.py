@@ -17,6 +17,13 @@ from kabu_app.collectors.edinet import (
     fetch_document_list,
 )
 from kabu_app.collectors.jpx import fetch_stock_list, parse_stock_list
+from kabu_app.collectors.tdnet import REQUEST_INTERVAL as TDNET_REQUEST_INTERVAL
+from kabu_app.collectors.tdnet import (
+    RETENTION_DAYS,
+    disclosure_path,
+    download_file,
+    fetch_disclosure_list,
+)
 from kabu_app.config import get_settings
 from kabu_app.db import create_session_factory, session_scope
 from kabu_app.stores.edinet import (
@@ -26,6 +33,13 @@ from kabu_app.stores.edinet import (
     pending_documents,
 )
 from kabu_app.stores.stock import load_stock_list
+from kabu_app.stores.tdnet import (
+    count_expired,
+    latest_disclosed_date,
+    load_disclosures,
+    pending_disclosures,
+)
+from kabu_app.stores.tdnet import mark_downloaded as mark_tdnet_downloaded
 
 logger = logging.getLogger("kabu_app")
 
@@ -229,5 +243,160 @@ def _download_pending(
         if downloaded % 100 == 0:
             logger.info("ZIP 取得 %d / %d 件", downloaded + reused, len(pending))
         time.sleep(REQUEST_INTERVAL)
+
+    return downloaded, reused, failed
+
+
+@fetch_app.command("tdnet")
+def fetch_tdnet(
+    from_date: Annotated[
+        str | None,
+        typer.Option("--from", help="取得開始の開示日 (YYYY-MM-DD)。省略時は取り込み済みの最新日"),
+    ] = None,
+    to_date: Annotated[
+        str | None,
+        typer.Option("--to", help="取得終了の開示日 (YYYY-MM-DD)。省略時は今日"),
+    ] = None,
+    skip_download: Annotated[
+        bool,
+        typer.Option("--skip-download", help="メタデータだけ取り込み、実体は落とさない"),
+    ] = False,
+    max_download: Annotated[
+        int | None,
+        typer.Option("--max-download", help="1 回の実行で落とす実体の上限"),
+    ] = None,
+) -> None:
+    """TDnet の決算短信とその訂正を取得する.
+
+    一覧も実体ファイルも 31 日ほどで消える。取り逃した日は二度と取れないので、
+    間を空けずに走らせること。EDINET のように後から遡ることはできない。
+    """
+    settings = get_settings()
+    end = date.fromisoformat(to_date) if to_date else date.today()
+    horizon = date.today() - timedelta(days=RETENTION_DAYS)
+
+    with session_scope(create_session_factory(settings.database_url)) as session:
+        start = _resolve_tdnet_start_date(session, from_date)
+        if start > end:
+            raise typer.BadParameter(f"開始日 {start} が終了日 {end} より後になっています")
+        if start < horizon:
+            logger.warning(
+                "%s より前は TDnet から消えている。%s からの取得になる", horizon, horizon
+            )
+            start = horizon
+
+        saved = _collect_disclosures(session, start, end)
+
+        if skip_download:
+            logger.info(
+                "完了: メタデータ %d 件 (--skip-download のため実体は取得していない)", saved
+            )
+            return
+
+        downloaded, reused, failed = _download_pending_disclosures(
+            session, settings.kabu_data_dir, horizon, max_download
+        )
+
+        expired = count_expired(session, horizon)
+
+    if expired:
+        logger.warning("期限切れで取れなくなった開示が %d 件ある", expired)
+    logger.info(
+        "完了: %s 〜 %s / メタデータ %d 件 / 実体 %d 件 (既存 %d 件, 失敗 %d 件)",
+        start,
+        end,
+        saved,
+        downloaded,
+        reused,
+        failed,
+    )
+
+
+def _resolve_tdnet_start_date(session: Session, from_date: str | None) -> date:
+    """取得を始める開示日を決める. 省略時は取り込み済みの最新開示日から取り直す."""
+    if from_date is not None:
+        return date.fromisoformat(from_date)
+
+    latest = latest_disclosed_date(session)
+    if latest is None:
+        raise typer.BadParameter(
+            "tdnet_disclosures が空です。初回は --from で開始日を指定してください"
+        )
+    logger.info("取り込み済みの最新開示日 %s から再開する", latest)
+    return latest
+
+
+def _collect_disclosures(session: Session, start: date, end: date) -> int:
+    """期間を 1 日ずつ舐めて開示メタデータを取り込む."""
+    logger.info("開示一覧を取得: %s 〜 %s (%d 日)", start, end, (end - start).days + 1)
+
+    saved = 0
+    target = start
+    while target <= end:
+        metas = fetch_disclosure_list(target)
+        count = load_disclosures(session, metas)
+        session.commit()
+
+        if count:
+            logger.info("%s: %d 件", target, count)
+        saved += count
+
+        target += timedelta(days=1)
+        if target <= end:
+            time.sleep(TDNET_REQUEST_INTERVAL)
+
+    return saved
+
+
+def _download_pending_disclosures(
+    session: Session, data_dir: Path, horizon: date, max_download: int | None
+) -> tuple[int, int, int]:
+    """実体が未取得の開示を落とす. XBRL があれば ZIP、無ければ PDF を取る."""
+    pending = pending_disclosures(session, horizon, limit=max_download)
+    if not pending:
+        return 0, 0, 0
+
+    logger.info("実体が未取得の開示が %d 件", len(pending))
+
+    downloaded = 0
+    reused = 0
+    failed = 0
+    consecutive_failures = 0
+
+    for disclosure in pending:
+        # XBRL が無い決算短信もある。中間決算短信に目立つ。その場合は PDF が本体になる。
+        if disclosure.xbrl_file is not None:
+            source = disclosure.xbrl_file
+            suffix = "zip"
+        else:
+            source = f"{disclosure.doc_id}.pdf"
+            suffix = "pdf"
+        path = disclosure_path(data_dir, disclosure.doc_id, disclosure.disclosed_date, suffix)
+
+        if path.exists():
+            mark_tdnet_downloaded(session, disclosure.doc_id)
+            session.commit()
+            reused += 1
+            continue
+
+        try:
+            download_file(source, path)
+        except (httpx.HTTPError, OSError) as error:
+            failed += 1
+            consecutive_failures += 1
+            logger.warning("%s の取得に失敗: %s", disclosure.doc_id, error)
+            if consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+                logger.error("%d 件続けて失敗したため中断する", consecutive_failures)
+                break
+            continue
+
+        mark_tdnet_downloaded(session, disclosure.doc_id)
+        session.commit()
+        downloaded += 1
+        consecutive_failures = 0
+
+        if downloaded % 100 == 0:
+            logger.info("実体 %d / %d 件", downloaded + reused, len(pending))
+        time.sleep(TDNET_REQUEST_INTERVAL)
 
     return downloaded, reused, failed
