@@ -480,6 +480,7 @@ def _collect_ticks(
             for page in fetch_quotes(code, start, end):
                 saved += save_quotes(session, page)
                 session.commit()
+                # ページを取った直後に空ける。これが次の銘柄の 1 ページ目との間隔にもなる。
                 time.sleep(YAHOO_REQUEST_INTERVAL)
         except (YahooPageError, httpx.HTTPError) as error:
             failed += 1
@@ -493,7 +494,6 @@ def _collect_ticks(
         consecutive_failures = 0
         if index % 100 == 0:
             logger.info("%d / %d 銘柄 (%d 件保存)", index, len(targets), saved)
-        time.sleep(YAHOO_REQUEST_INTERVAL)
 
     return saved, failed
 
