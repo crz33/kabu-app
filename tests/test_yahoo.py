@@ -5,12 +5,15 @@ from datetime import date
 from decimal import Decimal
 from typing import Any
 
+import httpx
 import pytest
 
+from kabu_app.collectors import yahoo
 from kabu_app.collectors.yahoo import (
     YahooPageError,
     _build_quote,
     _extract_histories,
+    _request,
     count_pages,
 )
 
@@ -113,3 +116,47 @@ def test_総件数からページ数を出す() -> None:
     assert count_pages(20) == 1
     assert count_pages(21) == 2
     assert count_pages(36) == 2
+
+
+def _client(responses: list[int]) -> tuple[httpx.Client, list[int]]:
+    """指定したステータスを順に返すクライアント。呼ばれた回数を数えられる."""
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        status = responses[min(len(calls), len(responses) - 1)]
+        calls.append(status)
+        return httpx.Response(status, content=b"<html></html>")
+
+    return httpx.Client(transport=httpx.MockTransport(handler)), calls
+
+
+def test_一時的な500は待って掛け直す(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Yahoo は数分にわたって 500 を返すことがある。全銘柄を回す途中だと総崩れになる."""
+    monkeypatch.setattr(yahoo.time, "sleep", lambda _: None)
+    client, calls = _client([500, 500, 200])
+
+    response = _request(client, "https://example.test/", {"page": "1"})
+
+    assert response.status_code == 200
+    assert calls == [500, 500, 200]
+
+
+def test_回復しなければ例外にする(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(yahoo.time, "sleep", lambda _: None)
+    client, calls = _client([500])
+
+    with pytest.raises(httpx.HTTPStatusError):
+        _request(client, "https://example.test/", {"page": "1"})
+
+    assert len(calls) == 4
+
+
+def test_404は掛け直さない(monkeypatch: pytest.MonkeyPatch) -> None:
+    """作りが変わったり銘柄が消えたりした場合。待っても直らない."""
+    monkeypatch.setattr(yahoo.time, "sleep", lambda _: None)
+    client, calls = _client([404])
+
+    with pytest.raises(httpx.HTTPStatusError):
+        _request(client, "https://example.test/", {"page": "1"})
+
+    assert len(calls) == 1

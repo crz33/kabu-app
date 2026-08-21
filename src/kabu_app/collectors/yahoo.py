@@ -9,6 +9,7 @@ API は無い。株価時系列のページを読む。中身は Next.js の RSC
 import json
 import logging
 import re
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -30,6 +31,17 @@ REQUEST_INTERVAL = 2.0
 
 _MAX_PAGES = 200
 """ページを舐めるときの歯止め. 20 営業日 x 200 で 16 年ぶん."""
+
+_RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
+"""待って掛け直せば通る見込みのあるステータス.
+
+Yahoo は数分にわたって 500 を返し続けることがある。全銘柄を回している最中にこれを
+食らうと、そこから先が総崩れになる。
+"""
+
+_MAX_RETRIES = 3
+_RETRY_BACKOFF = 5.0
+"""再試行の待ち秒数。5 秒、15 秒、45 秒と伸ばす."""
 
 _USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -86,8 +98,7 @@ def fetch_quotes(
     ) as client:
         total_pages = _MAX_PAGES
         for page in range(1, _MAX_PAGES + 1):
-            response = client.get(url, params={**params, "page": str(page)})
-            response.raise_for_status()
+            response = _request(client, url, {**params, "page": str(page)})
             histories, total_size = _extract_histories(response.content, code)
 
             if page == 1:
@@ -103,6 +114,30 @@ def fetch_quotes(
 
             if page >= total_pages:
                 return
+
+
+def _request(client: httpx.Client, url: str, params: dict[str, str]) -> httpx.Response:
+    """ページを 1 枚取る. 一時的なエラーは待って掛け直す.
+
+    Raises:
+        httpx.HTTPError: 再試行しても回復しなかった場合
+    """
+    for attempt in range(_MAX_RETRIES + 1):
+        response = client.get(url, params=params)
+        if response.status_code not in _RETRY_STATUS or attempt == _MAX_RETRIES:
+            response.raise_for_status()
+            return response
+
+        wait = _RETRY_BACKOFF * 3**attempt
+        logger.warning(
+            "%s ページ目が %d を返した。%.0f 秒待って掛け直す",
+            params.get("page"),
+            response.status_code,
+            wait,
+        )
+        time.sleep(wait)
+
+    raise AssertionError("到達しない")
 
 
 def count_pages(total_size: int) -> int:
