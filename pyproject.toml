@@ -45,6 +45,9 @@ select = ["E", "W", "F", "I", "B", "C4", "UP"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
+# XBRL の断片をそのまま埋めているテスト。要素名が長く、折ると読めなくなる
+"tests/test_edinet_xbrl.py" = ["E501"]
+"tests/test_shareholders.py" = ["E501"]
 
 [tool.mypy]
 python_version = "3.13"
