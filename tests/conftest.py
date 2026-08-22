@@ -10,7 +10,10 @@ from sqlalchemy.orm import Session
 from kabu_app.config import get_settings
 from kabu_app.db import create_db_engine
 
-_TABLES = "stocks, stock_snapshots, edinet_documents, tdnet_disclosures, ticks"
+_TABLES = (
+    "stocks, stock_snapshots, edinet_documents, edinet_facts, edinet_labels, "
+    "edinet_document_labels, edinet_shareholders, tdnet_disclosures, ticks"
+)
 """空にするテーブル。テーブルを足したらここにも足す.
 
 DELETE ではなく TRUNCATE を使う。ticks は 200 万行を超えるので、テストごとに全行を
