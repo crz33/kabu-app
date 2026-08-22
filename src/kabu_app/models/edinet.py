@@ -29,12 +29,17 @@ class EdinetDocument(Base, TimestampMixin):
 
     ``code`` に stocks への外部キーは張らない。上場廃止した会社の有報も残すため。
     上場中の銘柄に絞りたい分析は stocks と結合する。
+
+    訂正有報 (130) には API が ``period_end`` を返さない。どの期の訂正かは XBRL の DEI から
+    読んだ ``fiscal_year_end`` で決める。``parent_doc_id`` を辿る手もあるが、元の有報が DB に
+    無い訂正が 1,180 件中 595 件あり、それだと期が決まらない。
     """
 
     __tablename__ = "edinet_documents"
     __table_args__ = (
         Index("ix_edinet_documents_submit_date", "submit_date"),
         Index("ix_edinet_documents_code_period_end", "code", "period_end"),
+        Index("ix_edinet_documents_code_fiscal_year_end", "code", "fiscal_year_end"),
         {"comment": "EDINET 提出書類のメタデータ (有価証券報告書とその訂正)"},
     )
 
@@ -85,6 +90,11 @@ class EdinetDocument(Base, TimestampMixin):
         DateTime(timezone=True),
         nullable=True,
         comment="ZIP を保存した日時。NULL なら未取得で、次の実行が拾い直す",
+    )
+    fiscal_year_end: Mapped[date | None] = mapped_column(
+        Date,
+        nullable=True,
+        comment="XBRL の DEI から読んだ会計年度末。解析するまで NULL。どの期の書類かを表す",
     )
     parsed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),

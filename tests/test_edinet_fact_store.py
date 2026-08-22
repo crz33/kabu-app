@@ -85,16 +85,73 @@ def test_ZIPが未取得の書類は解析対象にしない(session: Session) -
     assert unparsed_documents(session) == []
 
 
-def test_訂正有報は解析対象にしない(session: Session) -> None:
-    """様式が有報と違い、同じ手順では財務諸表を取り出せない."""
+def test_訂正有報も解析対象にする(session: Session) -> None:
+    """様式は有報と同じで、同じ手順で読める。取り込まないと古い数値が残る."""
     from dataclasses import replace
 
-    amendment = replace(_META, doc_id="S100AMEND", doc_type_code="130", parent_doc_id=_DOC_ID)
+    amendment = replace(
+        _META, doc_id="S100AMEND", doc_type_code="130", parent_doc_id=_DOC_ID, period_end=None
+    )
     load_documents(session, [amendment])
     mark_downloaded(session, "S100AMEND")
     session.flush()
 
-    assert unparsed_documents(session) == []
+    assert [d.doc_id for d in unparsed_documents(session)] == ["S100AMEND"]
+
+
+def test_訂正有報の期はDEIから埋める(session: Session) -> None:
+    """API は 130 に periodEnd を返さない。埋めないと期ごとの最新版を選べない."""
+    from dataclasses import replace
+
+    amendment = replace(
+        _META, doc_id="S100AMEND", doc_type_code="130", parent_doc_id=_DOC_ID, period_end=None
+    )
+    load_documents(session, [amendment])
+    mark_downloaded(session, "S100AMEND")
+
+    mark_parsed(session, "S100AMEND", fiscal_year_end=date(2026, 5, 31))
+    session.flush()
+
+    document = session.get(EdinetDocument, "S100AMEND")
+    assert document is not None
+    assert document.period_end is None
+    assert document.fiscal_year_end == date(2026, 5, 31)
+
+
+def test_期ごとに最新の書類の数値を採る(session: Session) -> None:
+    """訂正があれば訂正の数値になる。訂正は差分ではなく全文なのでマージしない."""
+    from dataclasses import replace
+
+    _downloaded_document(session)
+    mark_parsed(session, _DOC_ID, fiscal_year_end=date(2026, 5, 31))
+    save_facts(session, _DOC_ID, [_fact("jppfs_cor_OperatingIncome", "CurrentYearDuration", "100")])
+
+    amendment = replace(
+        _META,
+        doc_id="S100AMEND",
+        doc_type_code="130",
+        parent_doc_id=_DOC_ID,
+        period_end=None,
+        submit_date=date(2026, 9, 30),
+    )
+    load_documents(session, [amendment])
+    mark_downloaded(session, "S100AMEND")
+    mark_parsed(session, "S100AMEND", fiscal_year_end=date(2026, 5, 31))
+    session.execute(
+        text(
+            "INSERT INTO edinet_facts (doc_id, section, concept, context_ref, ordinal, depth,"
+            " period_type, period_end, value) VALUES ('S100AMEND', 'PL',"
+            " 'jppfs_cor_OperatingIncome', 'CurrentYearDuration', 1, 2, 'duration',"
+            " '2026-05-31', 250)"
+        )
+    )
+    session.flush()
+
+    rows = session.execute(
+        text("SELECT doc_id, value FROM edinet_latest_facts WHERE code = :code"), {"code": "2168"}
+    ).all()
+
+    assert [(r[0], int(r[1])) for r in rows] == [("S100AMEND", 250)]
 
 
 def test_解析済みは対象から外れる(session: Session) -> None:

@@ -632,6 +632,9 @@ def parse_edinet(
     書類単位で消してから入れ直すので、同じ書類を 2 回解析しても壊れない。ZIP を取り直す
     必要は無い。失敗した書類は parsed_at が空のまま残り、次の実行が拾い直す。
 
+    訂正有報 (130) も同じ手順で解析する。訂正は差分ではなく全文なので、元とマージせず
+    書類ごとに丸ごと入れる。期ごとにどれが最新かは edinet_latest_facts が選ぶ。
+
     ラベルは書類に同梱されたものを ``edinet_document_labels`` に入れる。会社が標準の勘定に
     付けた言い換えが入るので、書類ごとに分けて持つ。金融庁のタクソノミにある標準ラベルは
     ``kabu parse taxonomy`` で別に入れる。
@@ -711,14 +714,16 @@ def _parse_one_document(session: Session, document: EdinetDocument, path: Path) 
     facts = save_facts(session, document.doc_id, parsed.facts)
     save_document_labels(session, document.doc_id, parsed.labels)
 
+    # 訂正有報には API が periodEnd を返さない。DEI から読んだ会計年度末で補う。
+    fiscal_year_end = parsed.info.fiscal_year_end
     holders = save_shareholders(
         session,
         document.doc_id,
         document.code,
-        document.period_end,
+        document.period_end or fiscal_year_end,
         parse_shareholders(path).shareholders,
     )
-    mark_parsed(session, document.doc_id)
+    mark_parsed(session, document.doc_id, fiscal_year_end=fiscal_year_end)
     return facts, holders
 
 
