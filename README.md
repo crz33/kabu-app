@@ -129,9 +129,16 @@ uv run alembic upgrade head --sql    # DB に触らず SQL を確認
 | --- | --- |
 | `stocks` | 銘柄マスタ。最新状態のみ。上場廃止は削除せず `is_listed = false` |
 | `stock_snapshots` | JPX 一覧の基準日ごとの全銘柄。市場変更や業種変更を後から追うため |
-| `edinet_documents` | EDINET の有報・訂正有報のメタデータ。ZIP の取得状況も持つ。上場廃止した銘柄も入る |
+| `edinet_documents` | EDINET の有報・訂正有報のメタデータ。ZIP と解析の状況も持つ。上場廃止した銘柄も入る |
+| `edinet_facts` | 有報の財務諸表の数値。1 行 1 数値。連結全体は `member IS NULL` で絞る |
+| `edinet_labels` | 金融庁のタクソノミが定める要素名の標準ラベル |
+| `edinet_document_labels` | 書類ごとのラベル。会社が付けた言い換えと独自の拡張要素 |
+| `edinet_shareholders` | 有報「大株主の状況」の上位株主。種別とオーナー判定つき |
 | `tdnet_disclosures` | TDnet の決算短信・訂正短信のメタデータ。実体の取得状況も持つ |
 | `ticks` | 日次の四本値と出来高。調整後終値も持つ。市場指数も同じ表に入る |
+
+ビューが 1 つある。`edinet_statement_lines` は `edinet_facts` にラベルを結合したもので、
+`ORDER BY ordinal` で並べると有報の計算書の形になる。
 
 JPX の銘柄一覧 (`data_j.xls`) には `日付` 列があり、これが基準日になる。JPX は月末時点のデータを 1 か月ほど遅れて公開するため、取得日とは一致しない。`stock_snapshots.base_date` にはこの `日付` 列を使う。
 
@@ -174,6 +181,155 @@ uv run kabu fetch edinet --from 2025-01-06
 
 日数ぶんの一覧取得が走る。ZIP は既存ぶんを再利用し、findocgen が取っていなかった訂正有報
 だけが新しく落ちる。
+
+## 有報の解析
+
+取得済みの ZIP から財務諸表の数値と大株主を取り出し、`edinet_facts` と
+`edinet_shareholders` に入れる。書類単位で消してから入れ直すので、同じ書類を何度解析しても
+壊れない。
+
+```bash
+uv run kabu parse edinet                       # 未解析の書類をすべて
+uv run kabu parse edinet --max-documents 100   # 100 件で打ち切る
+uv run kabu parse edinet --reparse             # 解析済みもやり直す。パーサを直したとき
+uv run kabu parse edinet --doc-id S100YW7F     # 書類を指定する
+uv run kabu parse taxonomy 2026                # タクソノミの日本語ラベルを入れる
+```
+
+失敗した書類は `parsed_at` が NULL のまま残り、次の実行が拾い直す。理由は `parse_error` に
+入る。10 件続けて失敗したら中断する。ZIP の置き場ごと見えていない場合など、続けても
+直らない壊れ方をしているため。
+
+訂正有価証券報告書 (`130`) は解析しない。本文の様式が有報と違い、同じ手順では財務諸表を
+取り出せない。メタデータだけ `edinet_documents` に残してある。
+
+### 1 行 1 数値で持つ
+
+財務諸表は 5 つに絞る。`BR` (主要な経営指標等の推移)、`BR_C` (同じく提出会社)、`BS`、`PL`、
+`CS`。株主資本等変動計算書・包括利益計算書・注記は取らない。1 書類あたり 700 行ほど、
+6800 書類で 500 万行になる。
+
+**`context_ref` を主キーに含めるのが要点**。同じ勘定・同じ期間でも、連結全体の値と
+セグメント別の値が並んで出てくる。実データでは営業利益の 7 割の書類でセグメント別が同居
+していた。連結全体だけが欲しいときは `member IS NULL` で絞る。
+
+```sql
+SELECT d.filer_name, l.label, f.period_end, f.value
+FROM edinet_facts f
+JOIN edinet_documents d ON d.doc_id = f.doc_id
+JOIN edinet_labels   l ON l.concept = f.concept
+WHERE f.concept = 'jppfs_cor_OperatingIncome'
+  AND f.section = 'PL'
+  AND f.member IS NULL
+ORDER BY f.period_end DESC;
+```
+
+値は**円**で入る。有報の表は百万円単位で刷られるが、XBRL の中身は円で、桁を丸めるのは表示
+側の仕事になる。`decimals` は原文の精度表示をそのまま残したもので、値のスケールとは関係
+しない。前身の findocgen は「百万円」と注記していたが、実際には円だった。
+
+### 計算書の形で読む
+
+`ordinal` と `depth` を持たせてあるので、有報に刷られた表をそのまま並べ直せる。`ordinal` は
+表示リンクを深さ優先でたどった通し番号、`depth` は階層の深さになる。ビューを用意してある。
+
+```sql
+SELECT depth, label, value
+FROM edinet_statement_lines
+WHERE doc_id = 'S100YWGX' AND section = 'PL' AND member IS NULL
+  AND period_end = '2026-05-31'
+ORDER BY ordinal;
+```
+
+```text
+売上高                        130,123,000,000
+売上原価                       56,295,000,000
+売上総利益又は売上総損失（△）           73,827,000,000
+  給料及び手当                    7,402,000,000
+  パート・アルバイト給与              20,654,000,000
+  販売費及び一般管理費               69,422,000,000
+営業利益又は営業損失（△）              4,405,000,000
+```
+
+表示リンクの節点は locator ではなく**勘定**にしてある。同じ勘定に locator が 2 つ振られる
+ことがあり、locator を単位に木を作ると根が分裂して途中で切れる。
+
+### ラベルは 2 段に分ける
+
+要素名の日本語ラベルは 2 つのテーブルに分けて持つ。500 万行それぞれに文言を持たせると同じ
+文字列が何百万回も重複するので、表示のときだけ結合する。
+
+| テーブル | 中身 | 入れ方 |
+| --- | --- | --- |
+| `edinet_labels` | 金融庁のタクソノミが定める標準ラベル | `parse taxonomy` |
+| `edinet_document_labels` | その書類での言い換え。会社独自の拡張要素も | `parse edinet` |
+
+**書類ごとに分けるのが要点**。会社は標準の勘定に独自の文言を付ける。`jppfs_cor_OperatingIncome`
+に「セグメント利益」と書く会社があり、全社で 1 行にまとめると他社の営業利益にもそれが出る。
+実測で、書類が独自ラベルを付けた標準要素 141 個のうち 20 個が会社ごとに割れていた。
+
+引くときは書類固有を優先し、無ければ標準に落とす。上のビューがこれをやっている。
+
+```sql
+COALESCE(dl.label, l.label)
+```
+
+タクソノミの ZIP は **API では取れない**。金融庁の「EDINET タクソノミ及びコードリスト」の
+ページから落として置く。
+
+```text
+<KABU_DATA_DIR>/edinet_taxonomy/Taxonomy_2026.zip
+```
+
+年 1 回、新しい年度が公開されたら流す。**古い年度から順に流すこと**。同じ要素は後から流した
+方で上書きされるので、逆順だと古い文言が残る。
+
+2024・2025・2026 の 3 年で文言が変わったのは 14 要素だけ。10 件は送り仮名や法令の条番号で、
+2 件は 2024 版で項目名の位置に使い方の説明が入っていたものの修正になる。
+
+残る 4 件は勘定科目名で、新リース会計基準に伴う「リース債務」から「リース負債」への言い換え。
+指す対象は同じだが、2026 版を流すと過去の有報にも新しい用語が出る。書類同梱のラベルは
+実測 161 件すべてで無かったので、ここはタクソノミの文言がそのまま表示される。
+
+```text
+jppfs_cor_LeaseObligationsCL / NCL             リース債務       → リース負債
+jppfs_cor_RepaymentsOfLeaseObligationsFinCF    リース債務の返済  → リース負債の返済
+jppfs_cor_IncreaseDecreaseInLeaseObligationsOpeCF               同上
+```
+
+分析には効かない。KPI も集計も要素名で引くため。原本どおりの文言で表示したくなったら、
+主キーを `(taxonomy_year, concept)` にして書類の年度で引く形に変える。そのときは提出日から
+年度を決める処理が要る。前身の findocgen はこれを持っていて、書類ごとの例外を TOML で
+手当てしていた。4 要素のために戻すには重いと判断した。
+
+年度は列に持たない。持たない代わりに、要素は消さずに溜める。upsert なので複数年を流すと
+和集合になり、廃止された要素も残る。2024・2025・2026 を流すと 9,041 要素で、2026 単体の
+8,298 より多い。
+
+過去のタクソノミを集め直す必要は無い。2022 年提出の有報でも、2024 年以降の 3 年分で
+勘定の 98.2% が引けた。残りは書類に同梱されており、どちらでも引けない勘定は 0% だった。
+年度で入れ替わるのは四半期報告書まわりの要素で、財務諸表の勘定は動かないため。
+
+### 大株主とオーナー判定
+
+有報の「大株主の状況」から上位 10 名を取り、`kind` で分類する。個人・役員・資産管理会社を
+オーナー系 (`is_owner`) として合算できる。
+
+```sql
+SELECT s.code, d.filer_name,
+       sum(s.ratio) FILTER (WHERE s.is_owner) AS owner_ratio,
+       sum(s.ratio)                           AS top_ratio
+FROM edinet_shareholders s
+JOIN edinet_documents d ON d.doc_id = s.doc_id
+GROUP BY s.code, d.filer_name;
+```
+
+判定は株主名の文字列からの推定で、外れる例が残る。根拠を追えるよう `name` と `kind` を必ず
+一緒に持つ。信託口とカストディは名義人なので外し、役員と同姓でも金融機関はオーナー家の
+ビークルとみなさない。松井証券のように、たまたま同姓の独立した会社を取り違えるため。
+
+役員の姓は名前の先頭 2〜3 文字から取る。空白では切れない。有報の役員名は「南 部　真 希 也」
+のように 1 文字ずつ空けて均等割り付けする書き方が多く、空白で分けると「南」しか残らない。
 
 ## TDnet
 

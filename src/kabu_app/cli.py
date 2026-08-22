@@ -2,6 +2,8 @@
 
 import logging
 import time
+import zipfile
+from collections.abc import Sequence
 from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -29,11 +31,23 @@ from kabu_app.collectors.yahoo import REQUEST_INTERVAL as YAHOO_REQUEST_INTERVAL
 from kabu_app.collectors.yahoo import YahooPageError, create_client, fetch_quotes, iter_periods
 from kabu_app.config import get_settings
 from kabu_app.db import create_session_factory, session_scope
+from kabu_app.models import EdinetDocument
+from kabu_app.parsers import EdinetXbrlError, parse_document, parse_shareholders
+from kabu_app.parsers.taxonomy import parse_taxonomy_labels, taxonomy_path
 from kabu_app.stores.edinet import (
     latest_submit_date,
     load_documents,
     mark_downloaded,
     pending_documents,
+)
+from kabu_app.stores.edinet_fact import (
+    documents_by_id,
+    mark_parsed,
+    save_document_labels,
+    save_facts,
+    save_labels,
+    save_shareholders,
+    unparsed_documents,
 )
 from kabu_app.stores.stock import load_stock_list
 from kabu_app.stores.tdnet import (
@@ -59,6 +73,8 @@ _MAX_CONSECUTIVE_FAILURES = 10
 app = typer.Typer(no_args_is_help=True, help="kabu の取得バッチ")
 fetch_app = typer.Typer(no_args_is_help=True, help="外部データを取得して DB に入れる")
 app.add_typer(fetch_app, name="fetch")
+parse_app = typer.Typer(no_args_is_help=True, help="取得済みのファイルを解析して DB に入れる")
+app.add_typer(parse_app, name="parse")
 
 
 @app.callback()
@@ -594,3 +610,138 @@ def _overlap_start(watch: tuple[date, Decimal] | None) -> date:
     if watch is None:
         return date.today() - timedelta(days=365)
     return watch[0]
+
+
+@parse_app.command("edinet")
+def parse_edinet(
+    max_documents: Annotated[
+        int | None,
+        typer.Option("--max-documents", help="1 回の実行で解析する書類数の上限"),
+    ] = None,
+    reparse: Annotated[
+        bool,
+        typer.Option("--reparse", help="解析済みの書類もやり直す。パーサを直したとき用"),
+    ] = False,
+    doc_ids: Annotated[
+        str | None,
+        typer.Option("--doc-id", help="書類管理番号をカンマ区切りで指定する。解析済みでもやり直す"),
+    ] = None,
+) -> None:
+    """取得済みの有価証券報告書を解析して edinet_facts と edinet_shareholders に入れる.
+
+    書類単位で消してから入れ直すので、同じ書類を 2 回解析しても壊れない。ZIP を取り直す
+    必要は無い。失敗した書類は parsed_at が空のまま残り、次の実行が拾い直す。
+
+    ラベルは書類に同梱されたものを ``edinet_document_labels`` に入れる。会社が標準の勘定に
+    付けた言い換えが入るので、書類ごとに分けて持つ。金融庁のタクソノミにある標準ラベルは
+    ``kabu parse taxonomy`` で別に入れる。
+    """
+    settings = get_settings()
+
+    with session_scope(create_session_factory(settings.database_url)) as session:
+        if doc_ids is not None:
+            documents = documents_by_id(
+                session, [part.strip() for part in doc_ids.split(",") if part.strip()]
+            )
+        else:
+            documents = unparsed_documents(session, limit=max_documents, include_parsed=reparse)
+        if not documents:
+            logger.info("解析する書類がありません")
+            return
+
+        logger.info("解析する書類が %d 件", len(documents))
+        parsed, failed, facts, holders = _parse_documents(
+            session, documents, settings.kabu_data_dir
+        )
+
+    logger.info(
+        "完了: %d 件解析 (失敗 %d 件) / ファクト %d 行 / 大株主 %d 行",
+        parsed,
+        failed,
+        facts,
+        holders,
+    )
+
+
+def _parse_documents(
+    session: Session, documents: Sequence[EdinetDocument], data_dir: Path
+) -> tuple[int, int, int, int]:
+    """書類を 1 件ずつ解析して書き込む. 戻りは (成功, 失敗, ファクト行, 大株主行)."""
+    parsed = 0
+    failed = 0
+    total_facts = 0
+    total_holders = 0
+    consecutive_failures = 0
+
+    for index, document in enumerate(documents, start=1):
+        path = document_path(data_dir, document.doc_id, document.submit_date)
+        try:
+            facts, holders = _parse_one_document(session, document, path)
+        except (EdinetXbrlError, zipfile.BadZipFile, OSError, ValueError) as error:
+            failed += 1
+            consecutive_failures += 1
+            logger.warning("%s の解析に失敗: %s", document.doc_id, error)
+            session.rollback()
+            mark_parsed(session, document.doc_id, error=f"{type(error).__name__}: {error}")
+            session.commit()
+            if consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+                # ZIP の置き場ごと見えていないなど、続けても直らない壊れ方をしている。
+                logger.error("%d 件続けて失敗したため中断する", consecutive_failures)
+                break
+            continue
+
+        session.commit()
+        parsed += 1
+        total_facts += facts
+        total_holders += holders
+        consecutive_failures = 0
+
+        if index % 100 == 0:
+            logger.info("%d / %d 件 (ファクト %d 行)", index, len(documents), total_facts)
+
+    return parsed, failed, total_facts, total_holders
+
+
+def _parse_one_document(session: Session, document: EdinetDocument, path: Path) -> tuple[int, int]:
+    """1 件を解析して書き込む. コミットは呼び出し側."""
+    if not path.exists():
+        raise FileNotFoundError(f"ZIP が見つかりません: {path}")
+
+    parsed = parse_document(path)
+    facts = save_facts(session, document.doc_id, parsed.facts)
+    save_document_labels(session, document.doc_id, parsed.labels)
+
+    holders = save_shareholders(
+        session,
+        document.doc_id,
+        document.code,
+        document.period_end,
+        parse_shareholders(path).shareholders,
+    )
+    mark_parsed(session, document.doc_id)
+    return facts, holders
+
+
+@parse_app.command("taxonomy")
+def parse_taxonomy(
+    year: Annotated[int, typer.Argument(help="タクソノミの年度 (例: 2025)")],
+) -> None:
+    """金融庁のタクソノミから標準ラベルを取り込んで edinet_labels に入れる.
+
+    ZIP は API では取れない。金融庁の「EDINET タクソノミ及びコードリスト」のページから
+    手で落として ``<KABU_DATA_DIR>/edinet_taxonomy/Taxonomy_YYYY.zip`` に置くこと。
+
+    年度をまたいで文言が変わることがある。新しい年度を後から流せば上書きされる。
+    """
+    settings = get_settings()
+    path = taxonomy_path(settings.kabu_data_dir, year)
+    if not path.exists():
+        raise typer.BadParameter(f"タクソノミの ZIP がありません: {path}")
+
+    logger.info("タクソノミを読む: %s", path)
+    labels = parse_taxonomy_labels(path)
+
+    with session_scope(create_session_factory(settings.database_url)) as session:
+        saved = save_labels(session, labels)
+
+    logger.info("完了: %d 件のラベルを取り込んだ", saved)
