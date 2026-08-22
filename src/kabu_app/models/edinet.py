@@ -33,6 +33,11 @@ class EdinetDocument(Base, TimestampMixin):
     訂正有報 (130) には API が ``period_end`` を返さない。どの期の訂正かは XBRL の DEI から
     読んだ ``fiscal_year_end`` で決める。``parent_doc_id`` を辿る手もあるが、元の有報が DB に
     無い訂正が 1,180 件中 595 件あり、それだと期が決まらない。
+
+    ``accounting_standard`` と ``is_consolidated`` は数値を読むのに要る。同じ勘定でも連結と
+    単体では意味が違い、会計基準が変われば使う要素名も変わる。ファクト側から推測はできるが、
+    US GAAP は日本 GAAP と要素の名前空間が同じで見分けられず、IFRS でも jppfs の要素が混ざる
+    書類がある。パーサのセクション割り当てから逆算するのも、実装を変えると壊れる。
     """
 
     __tablename__ = "edinet_documents"
@@ -90,6 +95,21 @@ class EdinetDocument(Base, TimestampMixin):
         DateTime(timezone=True),
         nullable=True,
         comment="ZIP を保存した日時。NULL なら未取得で、次の実行が拾い直す",
+    )
+    accounting_standard: Mapped[str | None] = mapped_column(
+        String(16),
+        nullable=True,
+        comment="会計基準 (Japan GAAP / IFRS / US GAAP)。解析するまで NULL",
+    )
+    is_consolidated: Mapped[bool | None] = mapped_column(
+        Boolean,
+        nullable=True,
+        comment="連結財務諸表を作る会社か。false なら数値はすべて単体。解析するまで NULL",
+    )
+    fiscal_year_start: Mapped[date | None] = mapped_column(
+        Date,
+        nullable=True,
+        comment="会計年度の開始日。fiscal_year_end との差で期の長さが分かる",
     )
     fiscal_year_end: Mapped[date | None] = mapped_column(
         Date,

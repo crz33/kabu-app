@@ -723,7 +723,7 @@ def _parse_one_document(session: Session, document: EdinetDocument, path: Path) 
         document.period_end or fiscal_year_end,
         parse_shareholders(path).shareholders,
     )
-    mark_parsed(session, document.doc_id, fiscal_year_end=fiscal_year_end)
+    mark_parsed(session, document.doc_id, info=parsed.info)
     return facts, holders
 
 

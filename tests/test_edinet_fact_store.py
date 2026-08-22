@@ -17,7 +17,7 @@ from kabu_app.models import (
     EdinetLabel,
     EdinetShareholder,
 )
-from kabu_app.parsers.edinet_xbrl import Fact
+from kabu_app.parsers.edinet_xbrl import DocumentInfo, Fact
 from kabu_app.parsers.shareholders import Shareholder
 from kabu_app.stores.edinet import load_documents, mark_downloaded
 from kabu_app.stores.edinet_fact import (
@@ -99,6 +99,18 @@ def test_訂正有報も解析対象にする(session: Session) -> None:
     assert [d.doc_id for d in unparsed_documents(session)] == ["S100AMEND"]
 
 
+def _info(**overrides: object) -> DocumentInfo:
+    base = {
+        "sec_code": "21680",
+        "filer_name": "株式会社パソナグループ",
+        "accounting_standard": "Japan GAAP",
+        "is_consolidated": True,
+        "fiscal_year_start": date(2025, 6, 1),
+        "fiscal_year_end": date(2026, 5, 31),
+    }
+    return DocumentInfo(**{**base, **overrides})  # type: ignore[arg-type]
+
+
 def test_訂正有報の期はDEIから埋める(session: Session) -> None:
     """API は 130 に periodEnd を返さない。埋めないと期ごとの最新版を選べない."""
     from dataclasses import replace
@@ -109,7 +121,7 @@ def test_訂正有報の期はDEIから埋める(session: Session) -> None:
     load_documents(session, [amendment])
     mark_downloaded(session, "S100AMEND")
 
-    mark_parsed(session, "S100AMEND", fiscal_year_end=date(2026, 5, 31))
+    mark_parsed(session, "S100AMEND", info=_info())
     session.flush()
 
     document = session.get(EdinetDocument, "S100AMEND")
@@ -118,12 +130,26 @@ def test_訂正有報の期はDEIから埋める(session: Session) -> None:
     assert document.fiscal_year_end == date(2026, 5, 31)
 
 
+def test_会計基準と連結の有無を書類に持つ(session: Session) -> None:
+    """数値を読むのに要る。ファクトから推測すると US GAAP を取り違える."""
+    _downloaded_document(session)
+
+    mark_parsed(session, _DOC_ID, info=_info(accounting_standard="IFRS", is_consolidated=False))
+    session.flush()
+
+    document = session.get(EdinetDocument, _DOC_ID)
+    assert document is not None
+    assert document.accounting_standard == "IFRS"
+    assert document.is_consolidated is False
+    assert document.fiscal_year_start == date(2025, 6, 1)
+
+
 def test_期ごとに最新の書類の数値を採る(session: Session) -> None:
     """訂正があれば訂正の数値になる。訂正は差分ではなく全文なのでマージしない."""
     from dataclasses import replace
 
     _downloaded_document(session)
-    mark_parsed(session, _DOC_ID, fiscal_year_end=date(2026, 5, 31))
+    mark_parsed(session, _DOC_ID, info=_info())
     save_facts(session, _DOC_ID, [_fact("jppfs_cor_OperatingIncome", "CurrentYearDuration", "100")])
 
     amendment = replace(
@@ -136,7 +162,7 @@ def test_期ごとに最新の書類の数値を採る(session: Session) -> None
     )
     load_documents(session, [amendment])
     mark_downloaded(session, "S100AMEND")
-    mark_parsed(session, "S100AMEND", fiscal_year_end=date(2026, 5, 31))
+    mark_parsed(session, "S100AMEND", info=_info())
     session.execute(
         text(
             "INSERT INTO edinet_facts (doc_id, section, concept, context_ref, ordinal, depth,"

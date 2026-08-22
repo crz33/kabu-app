@@ -129,7 +129,7 @@ uv run alembic upgrade head --sql    # DB に触らず SQL を確認
 | --- | --- |
 | `stocks` | 銘柄マスタ。最新状態のみ。上場廃止は削除せず `is_listed = false` |
 | `stock_snapshots` | JPX 一覧の基準日ごとの全銘柄。市場変更や業種変更を後から追うため |
-| `edinet_documents` | EDINET の有報・訂正有報のメタデータ。ZIP と解析の状況も持つ。上場廃止した銘柄も入る |
+| `edinet_documents` | EDINET の有報・訂正有報のメタデータ。会計基準・連結の有無・ZIP と解析の状況も持つ |
 | `edinet_facts` | 有報の財務諸表の数値。1 行 1 数値。連結全体は `member IS NULL` で絞る |
 | `edinet_labels` | 金融庁のタクソノミが定める要素名の標準ラベル |
 | `edinet_document_labels` | 書類ごとのラベル。会社が付けた言い換えと独自の拡張要素 |
@@ -215,6 +215,18 @@ uv run kabu parse taxonomy 2026                # タクソノミの日本語ラ�
 マージはむしろ誤りになる。訂正側で消えるファクトが 18 組 68 件あり、中身は PER・ROE・
 希薄化 EPS・配当性向だった。赤字だと PER は算定できず有報に載らない。訂正で損益が動いた
 結果として消えているので、元から拾い直すと算定不能な値が残る。
+
+### 数値を読むのに要る情報は書類に持たせる
+
+`edinet_documents` は解析のときに XBRL の DEI から 4 つを埋める。会計基準
+`accounting_standard`、連結の有無 `is_consolidated`、会計年度の `fiscal_year_start` /
+`fiscal_year_end`。同じ勘定でも連結と単体では意味が違い、会計基準が変われば使う要素名も
+変わるので、ファクトを読む前にこれが要る。
+
+ファクト側から推測はできるが、当てにしない。**US GAAP は日本 GAAP と要素の名前空間が同じ**で
+見分けられない (880 書類の実測では US GAAP が 1 件も出ず、判別条件を確かめられなかった)。
+IFRS でも `jppfs` の要素が混ざる書類がある。連結の有無を `BR_C` セクションの有無から逆算する
+のも、パーサのセクション割り当てを変えると壊れる。
 
 ### 1 行 1 数値で持つ
 

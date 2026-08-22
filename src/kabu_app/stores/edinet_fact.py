@@ -22,7 +22,7 @@ from kabu_app.models import (
     EdinetLabel,
     EdinetShareholder,
 )
-from kabu_app.parsers.edinet_xbrl import Fact
+from kabu_app.parsers.edinet_xbrl import DocumentInfo, Fact
 from kabu_app.parsers.shareholders import Shareholder
 
 logger = logging.getLogger(__name__)
@@ -187,7 +187,7 @@ def save_shareholders(
 def mark_parsed(
     session: Session,
     doc_id: str,
-    fiscal_year_end: date | None = None,
+    info: DocumentInfo | None = None,
     error: str | None = None,
 ) -> None:
     """解析の結果を書類に記録する. コミットは呼び出し側の責任.
@@ -195,8 +195,8 @@ def mark_parsed(
     失敗したときは parsed_at を空のままにする。次の実行が拾い直せるようにするため。
     理由だけ parse_error に残す。
 
-    ``fiscal_year_end`` は XBRL の DEI から読んだ会計年度末。訂正有報には API が期を返さ
-    ないので、ここで埋めないと期ごとの最新版を選べない。
+    ``info`` は XBRL の DEI から読んだ書類の素性。会計基準と連結の有無は数値を読むのに要る。
+    訂正有報には API が期を返さないので、ここで埋めないと期ごとの最新版も選べない。
     """
     values: dict[str, Any] = {
         "parsed_at": None if error is not None else func.now(),
@@ -204,8 +204,11 @@ def mark_parsed(
         "parse_error": error[:2000] if error is not None else None,
         "updated_at": func.now(),
     }
-    if fiscal_year_end is not None:
-        values["fiscal_year_end"] = fiscal_year_end
+    if info is not None:
+        values["accounting_standard"] = info.accounting_standard
+        values["is_consolidated"] = info.is_consolidated
+        values["fiscal_year_start"] = info.fiscal_year_start
+        values["fiscal_year_end"] = info.fiscal_year_end
 
     session.execute(update(EdinetDocument).where(EdinetDocument.doc_id == doc_id).values(**values))
 
