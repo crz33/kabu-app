@@ -9,12 +9,20 @@ import logging
 from collections.abc import Iterator, Sequence
 from typing import Any
 
-from sqlalchemy import Select, delete, func, select, update
+from sqlalchemy import Select, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
-from kabu_app.models import TdnetDisclosure, TdnetStatementFact, TdnetSummaryFact
+from kabu_app.models import (
+    TdnetDisclosure,
+    TdnetFinancial,
+    TdnetStatementFact,
+    TdnetSummaryFact,
+)
+from kabu_app.normalizers.tdnet_financials import FinancialValue as TdnetFinancialValue
+from kabu_app.normalizers.tdnet_financials import SourceFact as TdnetSourceFact
 from kabu_app.parsers.tdnet_xbrl import DisclosureInfo, StatementFact, SummaryFact
+from kabu_app.stores.edinet_financial import NON_CONSOLIDATED_MEMBER
 
 logger = logging.getLogger(__name__)
 
@@ -182,3 +190,124 @@ def mark_no_xbrl(session: Session, doc_id: str) -> None:
 def _chunked(rows: Sequence[dict[str, Any]]) -> Iterator[Sequence[dict[str, Any]]]:
     for start in range(0, len(rows), _CHUNK_SIZE):
         yield rows[start : start + _CHUNK_SIZE]
+
+
+def disclosures_to_normalize(
+    session: Session, limit: int | None = None, renormalize: bool = False
+) -> Sequence[TdnetDisclosure]:
+    """解析済みで、まだ名寄せしていない開示を古い順に返す.
+
+    ``renormalize`` を立てると名寄せ済みも返す。項目の定義を直して全件を作り直すとき用。
+
+    XBRL の無い短信は外す。``mark_no_xbrl`` が理由を残しているので、それで見分ける。
+    """
+    normalized = select(TdnetFinancial.doc_id).distinct().scalar_subquery()
+    statement: Select[tuple[TdnetDisclosure]] = (
+        select(TdnetDisclosure)
+        .where(
+            TdnetDisclosure.parsed_at.is_not(None),
+            TdnetDisclosure.parse_error.is_(None),
+        )
+        .order_by(TdnetDisclosure.disclosed_date, TdnetDisclosure.doc_id)
+    )
+    if not renormalize:
+        statement = statement.where(TdnetDisclosure.doc_id.not_in(normalized))
+    if limit is not None:
+        statement = statement.limit(limit)
+    return session.execute(statement).scalars().all()
+
+
+def load_statement_source_facts(
+    session: Session, doc_id: str, is_consolidated: bool | None
+) -> list[TdnetSourceFact]:
+    """名寄せの入力を 1 書類分そろえる.
+
+    絞りには 2 つの軸が要る。添付はファイルが連結と単体で分かれており、その中の context に
+    も区分が入る。連結企業は連結のファイルを見て ``member IS NULL`` を採る。連結企業でも
+    単体の計算書を出すことがあり、そちらは ``NonConsolidatedMember`` が付くのでここで落ちる。
+
+    単体決算の会社は ``NonConsolidatedMember`` も通す。この会社にとってはそれが唯一の
+    数値になる。実測 763 書類では ``member IS NULL`` の行が書類あたり 1 つしかなく、中身は
+    提出回数の DEI だった。有報とまったく同じ構造で、連結企業と同じ条件で引くとこの 763
+    書類から 1 項目も取れない。
+
+    連結の指定が無い書類は連結として扱う。実測では表紙の入らない書類だけがそうなり、
+    400 件で 2 件だった。
+
+    セグメント別の値は落とす。損益計算書と貸借対照表だけを見る。包括利益・株主資本等変動・
+    セグメントに 6 項目は入らない。
+
+    ``PC`` は ``PL`` として扱う。どちらも損益計算書で、中身は同じ ``jppfs_cor`` の要素に
+    なる。実測では ``PC`` だけを持つ書類が 136 件あり、落とすとその会社がまるごと空になる。
+    両方を持つ書類も 7 件あるが、同じ期の同じ項目は 1 つに絞られるのでぶつからない。
+    ``tdnet_statement_facts`` では別の section のまま残し、ここでだけ寄せる。
+    """
+    member_filter = (
+        TdnetStatementFact.member.is_(None)
+        if is_consolidated is not False
+        else or_(
+            TdnetStatementFact.member.is_(None),
+            TdnetStatementFact.member == NON_CONSOLIDATED_MEMBER,
+        )
+    )
+
+    rows = session.execute(
+        select(
+            TdnetStatementFact.section,
+            TdnetStatementFact.concept,
+            TdnetStatementFact.context_ref,
+            TdnetStatementFact.period_type,
+            TdnetStatementFact.period_start,
+            TdnetStatementFact.period_end,
+            TdnetStatementFact.value,
+            TdnetStatementFact.unit,
+        ).where(
+            TdnetStatementFact.doc_id == doc_id,
+            member_filter,
+            TdnetStatementFact.section.in_(("PL", "PC", "BS")),
+            TdnetStatementFact.is_consolidated.is_(is_consolidated is not False),
+        )
+    ).all()
+
+    return [
+        TdnetSourceFact(
+            section="PL" if row.section == "PC" else row.section,
+            concept=row.concept,
+            context_ref=row.context_ref,
+            period_type=row.period_type,
+            period_start=row.period_start,
+            period_end=row.period_end,
+            value=row.value,
+            unit=row.unit,
+        )
+        for row in rows
+    ]
+
+
+def save_tdnet_financials(
+    session: Session, doc_id: str, values: Sequence[TdnetFinancialValue]
+) -> int:
+    """名寄せの結果を入れ替える. コミットは呼び出し側の責任."""
+    session.execute(delete(TdnetFinancial).where(TdnetFinancial.doc_id == doc_id))
+    if not values:
+        return 0
+
+    rows = [
+        {
+            "doc_id": doc_id,
+            "item": value.item,
+            "period_kind": value.period_kind,
+            "period_end": value.period_end,
+            "period_start": value.period_start,
+            "value": value.value,
+            "unit": value.unit,
+            "source_section": value.source_section,
+            "source_concept": value.source_concept,
+        }
+        for value in values
+    ]
+    for chunk in _chunked(rows):
+        session.execute(insert(TdnetFinancial), list(chunk))
+
+    session.flush()
+    return len(rows)

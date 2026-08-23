@@ -4,6 +4,7 @@ from collections.abc import Iterator
 
 import pytest
 from sqlalchemy import text
+from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
@@ -13,7 +14,7 @@ from kabu_app.db import create_db_engine
 _TABLES = (
     "stocks, stock_snapshots, edinet_documents, edinet_facts, edinet_labels, "
     "edinet_document_labels, edinet_shareholders, edinet_financials, tdnet_disclosures, "
-    "tdnet_summary_facts, tdnet_statement_facts, ticks"
+    "tdnet_summary_facts, tdnet_statement_facts, tdnet_financials, ticks"
 )
 """空にするテーブル。テーブルを足したらここにも足す.
 
@@ -22,13 +23,23 @@ DELETE ではなく TRUNCATE を使う。ticks は 200 万行を超えるので�
 """
 
 
+@pytest.fixture(scope="session")
+def engine() -> Engine:
+    """テスト全体で 1 つの Engine を使い回す.
+
+    Engine は接続プールを持つ。テストごとに作ると、テストの数だけプールが積み上がって
+    接続を食い潰す。ラズパイの ``max_connections`` は 20 しかなく、実際にこれで
+    「remaining connection slots are reserved」に当たった。
+    """
+    return create_db_engine(get_settings().database_url)
+
+
 @pytest.fixture
-def session() -> Iterator[Session]:
+def session(engine: Engine) -> Iterator[Session]:
     """空のテーブルを持つセッション。終了時にロールバックするので DB は元に戻る.
 
     DB に繋げないときはスキップする。
     """
-    engine = create_db_engine(get_settings().database_url)
     try:
         connection = engine.connect()
     except OperationalError as error:

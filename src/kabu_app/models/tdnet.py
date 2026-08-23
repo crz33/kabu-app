@@ -265,3 +265,69 @@ class TdnetStatementFact(Base, TimestampMixin):
     decimals: Mapped[str | None] = mapped_column(
         String(8), nullable=True, comment="原文の精度表示。値のスケールとは関係しない"
     )
+
+
+class TdnetFinancial(Base, TimestampMixin):
+    """決算短信の添付を名寄せした財務項目 1 つ.
+
+    有報の ``edinet_financials`` と同じ項目に寄せてある。添付は ``jppfs_cor`` /
+    ``jpigp_cor`` と有報と同じ体系なので、名寄せの定義を共有できる。有報が年 1 回なのに
+    対し、こちらは四半期ごとに入る。
+
+    有報と違うのは ``period_kind`` を持つこと。短信は同じ期末に**年初来累計と単独四半期**が
+    並ぶ。「Q2 累計 100 億」と「Q2 単独 50 億」を取り違えると致命的なので、主キーに含める。
+
+    連結と単体はどちらか一方だけを入れる。連結財務諸表を作る会社は連結、作らない会社は
+    単体になる。有報と同じ扱いで、``tdnet_disclosures.is_consolidated`` で選ぶ。
+
+    実績はこちらを使うこと。表紙 (``tdnet_summary_facts``) にも同じ数値が載るが、
+    百万円に丸めてある。表紙を読むのは会社予想のためになる。
+    """
+
+    __tablename__ = "tdnet_financials"
+    __table_args__ = (
+        Index("ix_tdnet_financials_item_period_end", "item", "period_end"),
+        Index("ix_tdnet_financials_period_kind", "period_kind"),
+        {"comment": "決算短信の添付を共通の財務項目に名寄せした値"},
+    )
+
+    doc_id: Mapped[str] = mapped_column(
+        String(24),
+        ForeignKey("tdnet_disclosures.doc_id", ondelete="CASCADE"),
+        primary_key=True,
+        comment="TDnet 書類 ID (FK: tdnet_disclosures.doc_id)",
+    )
+    item: Mapped[str] = mapped_column(
+        String(32),
+        primary_key=True,
+        comment="財務項目 (net_sales/operating_income/ordinary_income/net_income/"
+        "total_assets/net_assets)。有報の edinet_financials と同じ",
+    )
+    period_kind: Mapped[str] = mapped_column(
+        String(16),
+        primary_key=True,
+        comment="期の種類。ytd (年初来累計) / quarter (単独四半期) / year (通期) / "
+        "interim (中間) と、時点の quarter_end / year_end / interim_end",
+    )
+    period_end: Mapped[date] = mapped_column(
+        Date, primary_key=True, comment="期間の末日、または時点の日付"
+    )
+    period_start: Mapped[date | None] = mapped_column(
+        Date, nullable=True, comment="期間の開始日。時点の項目では NULL"
+    )
+    value: Mapped[Decimal] = mapped_column(
+        Numeric, nullable=False, comment="値。円のまま入れる。丸めるのは表示側の仕事"
+    )
+    unit: Mapped[str | None] = mapped_column(
+        String(24), nullable=True, comment="単位 (JPY)。元のファクトのものをそのまま持つ"
+    )
+    source_section: Mapped[str] = mapped_column(
+        String(4),
+        nullable=False,
+        comment="どこから取ったか。PL: 損益計算書 / BS: 貸借対照表",
+    )
+    source_concept: Mapped[str] = mapped_column(
+        String(512),
+        nullable=False,
+        comment="元の XBRL 要素名。名寄せの判断を後から検証するために必ず残す",
+    )

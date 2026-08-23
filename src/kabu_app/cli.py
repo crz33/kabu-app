@@ -33,9 +33,10 @@ from kabu_app.config import get_settings
 from kabu_app.db import create_session_factory, session_scope
 from kabu_app.models import EdinetDocument, TdnetDisclosure
 from kabu_app.normalizers.financials import ITEMS, normalize
+from kabu_app.normalizers.tdnet_financials import normalize as normalize_tdnet
 from kabu_app.parsers import EdinetXbrlError, parse_document, parse_shareholders
 from kabu_app.parsers.taxonomy import parse_taxonomy_labels, taxonomy_path
-from kabu_app.parsers.tdnet_xbrl import TdnetXbrlError, parse_disclosure
+from kabu_app.parsers.tdnet_xbrl import TdnetXbrlError, complete_info, parse_disclosure
 from kabu_app.stores.edinet import (
     latest_submit_date,
     load_documents,
@@ -66,9 +67,12 @@ from kabu_app.stores.tdnet import (
 from kabu_app.stores.tdnet import mark_downloaded as mark_tdnet_downloaded
 from kabu_app.stores.tdnet_fact import (
     disclosures_by_id,
+    disclosures_to_normalize,
+    load_statement_source_facts,
     mark_no_xbrl,
     save_statement_facts,
     save_summary_facts,
+    save_tdnet_financials,
     unparsed_disclosures,
 )
 from kabu_app.stores.tdnet_fact import mark_parsed as mark_tdnet_parsed
@@ -954,5 +958,76 @@ def _parse_one_disclosure(
     parsed = parse_disclosure(path)
     summary = save_summary_facts(session, disclosure.doc_id, parsed.summary_facts)
     statement = save_statement_facts(session, disclosure.doc_id, parsed.statement_facts)
-    mark_tdnet_parsed(session, disclosure.doc_id, info=parsed.info)
+    mark_tdnet_parsed(session, disclosure.doc_id, info=complete_info(parsed.info, disclosure.title))
     return summary, statement
+
+
+@normalize_app.command("tdnet-financials")
+def normalize_tdnet_financials(
+    max_disclosures: Annotated[
+        int | None,
+        typer.Option("--max-disclosures", help="1 回の実行で名寄せする開示数の上限"),
+    ] = None,
+    renormalize: Annotated[
+        bool,
+        typer.Option("--renormalize", help="名寄せ済みの開示もやり直す。項目を直したとき用"),
+    ] = False,
+) -> None:
+    """解析済みの短信の添付を財務項目に寄せて tdnet_financials に入れる.
+
+    項目の定義は有報と共有する。添付は jppfs_cor / jpigp_cor と有報と同じ体系なので、
+    ``normalizers.financials.ITEM_SPECS`` がそのまま効く。有報が年 1 回なのに対し、
+    こちらは四半期ごとに入るので粒度が上がる。
+
+    有報と違って period_kind を持つ。同じ期末に年初来累計 (ytd) と単独四半期 (quarter) が
+    並ぶため。「Q2 累計 100 億」と「Q2 単独 50 億」は別物になる。
+
+    ファイルは読まない。tdnet_statement_facts から作るので、ZIP を取り直す必要も解析し直す
+    必要も無い。書類単位で消してから入れ直すため、2 回流しても壊れない。
+    """
+    settings = get_settings()
+
+    with session_scope(create_session_factory(settings.database_url)) as session:
+        disclosures = disclosures_to_normalize(
+            session, limit=max_disclosures, renormalize=renormalize
+        )
+        if not disclosures:
+            logger.info("名寄せする開示がありません")
+            return
+
+        logger.info("名寄せする開示が %d 件", len(disclosures))
+        rows, empty = _normalize_tdnet_documents(session, disclosures)
+
+    logger.info(
+        "完了: %d 件 / %d 行 (%d 項目) / 1 項目も取れなかった開示 %d 件",
+        len(disclosures),
+        rows,
+        len(ITEMS),
+        empty,
+    )
+
+
+def _normalize_tdnet_documents(
+    session: Session, disclosures: Sequence[TdnetDisclosure]
+) -> tuple[int, int]:
+    """開示を 1 件ずつ名寄せして書き込む. 戻りは (書き込んだ行, 空だった開示数).
+
+    1 項目も取れない開示はありうる。添付にセグメント情報しか入っていない短信がある。
+    エラーにはせず件数だけ数える。
+    """
+    total_rows = 0
+    empty = 0
+
+    for index, disclosure in enumerate(disclosures, start=1):
+        facts = load_statement_source_facts(session, disclosure.doc_id, disclosure.is_consolidated)
+        values = normalize_tdnet(facts)
+        total_rows += save_tdnet_financials(session, disclosure.doc_id, values)
+        if not values:
+            empty += 1
+            logger.debug("%s (%s) は 1 項目も取れなかった", disclosure.doc_id, disclosure.code)
+        session.commit()
+
+        if index % 500 == 0:
+            logger.info("%d / %d 件 (%d 行)", index, len(disclosures), total_rows)
+
+    return total_rows, empty

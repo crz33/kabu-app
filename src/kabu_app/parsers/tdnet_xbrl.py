@@ -313,14 +313,14 @@ def _read_disclosure_info(root: etree._Element) -> DisclosureInfo:
         document_name=document_name,
         sec_code=texts.get("SecuritiesCode") or None,
         company_name=texts.get("CompanyName") or None,
-        accounting_standard=_accounting_standard(document_name),
-        is_consolidated=_is_consolidated(document_name),
+        accounting_standard=accounting_standard_of(document_name),
+        is_consolidated=is_consolidated_of(document_name),
         fiscal_year_end=_to_date(texts.get("FiscalYearEnd")),
-        quarter=_quarter(texts.get("QuarterlyPeriod"), document_name),
+        quarter=quarter_of(texts.get("QuarterlyPeriod"), document_name),
     )
 
 
-def _accounting_standard(document_name: str | None) -> str | None:
+def accounting_standard_of(document_name: str | None) -> str | None:
     """表題から会計基準を読む."""
     if not document_name:
         return None
@@ -330,7 +330,7 @@ def _accounting_standard(document_name: str | None) -> str | None:
     return None
 
 
-def _is_consolidated(document_name: str | None) -> bool | None:
+def is_consolidated_of(document_name: str | None) -> bool | None:
     """表題から連結かどうかを読む.
 
     括弧は全角と半角が混ざる。「（非連結）」と「(非連結)」の両方が実在する。
@@ -344,7 +344,7 @@ def _is_consolidated(document_name: str | None) -> bool | None:
     return None
 
 
-def _quarter(quarterly_period: str | None, document_name: str | None) -> str | None:
+def quarter_of(quarterly_period: str | None, document_name: str | None) -> str | None:
     """四半期の区分を決める.
 
     ``QuarterlyPeriod`` を優先する。実測ではこの要素を持つ書類が 60 件中 43 件しか無く、
@@ -628,3 +628,28 @@ def _to_date(text: str | None) -> date | None:
         return date.fromisoformat(text.strip())
     except ValueError:
         return None
+
+
+def complete_info(info: DisclosureInfo, title: str) -> DisclosureInfo:
+    """表紙から読めなかった素性を、TDnet 一覧の表題から補う.
+
+    表紙の ``DocumentName`` と一覧の表題はどちらも「2025年２月期 第３四半期決算短信
+    〔ＩＦＲＳ〕(非連結)」の形で、会計基準と連結の有無を同じように書いてある。
+
+    表紙の入らない書類がある。実測 3,725 書類のうち 7 件で、決算期を変えた会社の
+    「第５四半期決算短信」などが該当した。表紙はあっても ``DocumentName`` を読めない書類も
+    7 件あった。どちらも一覧の表題は持っているので、そちらで埋める。
+
+    会計年度末だけは補えない。表題に決算期は載るが、月までで日が分からない。
+    """
+    return DisclosureInfo(
+        document_name=info.document_name,
+        sec_code=info.sec_code,
+        company_name=info.company_name,
+        accounting_standard=info.accounting_standard or accounting_standard_of(title),
+        is_consolidated=(
+            info.is_consolidated if info.is_consolidated is not None else is_consolidated_of(title)
+        ),
+        fiscal_year_end=info.fiscal_year_end,
+        quarter=info.quarter or quarter_of(None, title),
+    )
