@@ -5,6 +5,7 @@ from kabu_app.models.edinet import (
     EdinetDocument,
     EdinetDocumentLabel,
     EdinetFact,
+    EdinetFinancial,
     EdinetLabel,
     EdinetShareholder,
 )
@@ -18,6 +19,7 @@ __all__ = [
     "EdinetDocument",
     "EdinetDocumentLabel",
     "EdinetFact",
+    "EdinetFinancial",
     "EdinetLabel",
     "EdinetShareholder",
     "Stock",

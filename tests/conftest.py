@@ -12,7 +12,7 @@ from kabu_app.db import create_db_engine
 
 _TABLES = (
     "stocks, stock_snapshots, edinet_documents, edinet_facts, edinet_labels, "
-    "edinet_document_labels, edinet_shareholders, tdnet_disclosures, ticks"
+    "edinet_document_labels, edinet_shareholders, edinet_financials, tdnet_disclosures, ticks"
 )
 """空にするテーブル。テーブルを足したらここにも足す.
 

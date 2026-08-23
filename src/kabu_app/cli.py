@@ -32,6 +32,7 @@ from kabu_app.collectors.yahoo import YahooPageError, create_client, fetch_quote
 from kabu_app.config import get_settings
 from kabu_app.db import create_session_factory, session_scope
 from kabu_app.models import EdinetDocument
+from kabu_app.normalizers.financials import ITEMS, normalize
 from kabu_app.parsers import EdinetXbrlError, parse_document, parse_shareholders
 from kabu_app.parsers.taxonomy import parse_taxonomy_labels, taxonomy_path
 from kabu_app.stores.edinet import (
@@ -48,6 +49,11 @@ from kabu_app.stores.edinet_fact import (
     save_labels,
     save_shareholders,
     unparsed_documents,
+)
+from kabu_app.stores.edinet_financial import (
+    documents_to_normalize,
+    load_source_facts,
+    save_financials,
 )
 from kabu_app.stores.stock import load_stock_list
 from kabu_app.stores.tdnet import (
@@ -75,6 +81,8 @@ fetch_app = typer.Typer(no_args_is_help=True, help="外部データを取得し�
 app.add_typer(fetch_app, name="fetch")
 parse_app = typer.Typer(no_args_is_help=True, help="取得済みのファイルを解析して DB に入れる")
 app.add_typer(parse_app, name="parse")
+normalize_app = typer.Typer(no_args_is_help=True, help="取り込み済みのデータを名寄せする")
+app.add_typer(normalize_app, name="normalize")
 
 
 @app.callback()
@@ -750,3 +758,69 @@ def parse_taxonomy(
         saved = save_labels(session, labels)
 
     logger.info("完了: %d 件のラベルを取り込んだ", saved)
+
+
+@normalize_app.command("financials")
+def normalize_financials(
+    max_documents: Annotated[
+        int | None,
+        typer.Option("--max-documents", help="1 回の実行で名寄せする書類数の上限"),
+    ] = None,
+    renormalize: Annotated[
+        bool,
+        typer.Option("--renormalize", help="名寄せ済みの書類もやり直す。項目を直したとき用"),
+    ] = False,
+) -> None:
+    """解析済みのファクトを財務項目に寄せて edinet_financials に入れる.
+
+    ファイルは読まない。``edinet_facts`` から作るので、ZIP を取り直す必要も解析し直す
+    必要も無い。書類単位で消してから入れ直すため、2 回流しても壊れない。
+
+    1 書類から複数期が入る。「主要な経営指標等」は 5 期分を載せるので、2026 年の有報から
+    2022 年の売上高まで取れる。期ごとにどれを使うかは edinet_latest_financials が選ぶ。
+
+    項目の定義を変えたら ``--renormalize`` で全件を作り直すこと。ファクトはそのまま使う
+    ので、解析のやり直しよりずっと速い。
+    """
+    settings = get_settings()
+
+    with session_scope(create_session_factory(settings.database_url)) as session:
+        documents = documents_to_normalize(session, limit=max_documents, renormalize=renormalize)
+        if not documents:
+            logger.info("名寄せする書類がありません")
+            return
+
+        logger.info("名寄せする書類が %d 件", len(documents))
+        rows, empty = _normalize_documents(session, documents)
+
+    logger.info(
+        "完了: %d 件 / %d 行 (%d 項目) / 1 項目も取れなかった書類 %d 件",
+        len(documents),
+        rows,
+        len(ITEMS),
+        empty,
+    )
+
+
+def _normalize_documents(session: Session, documents: Sequence[EdinetDocument]) -> tuple[int, int]:
+    """書類を 1 件ずつ名寄せして書き込む. 戻りは (書き込んだ行, 空だった書類数).
+
+    1 項目も取れない書類はありうる。要素名が全部会社独自の拡張になっている場合になる。
+    エラーにはせず件数だけ数える。多いようなら項目の定義を足すこと。
+    """
+    total_rows = 0
+    empty = 0
+
+    for index, document in enumerate(documents, start=1):
+        facts = load_source_facts(session, document.doc_id, document.is_consolidated)
+        values = normalize(facts)
+        total_rows += save_financials(session, document.doc_id, values)
+        if not values:
+            empty += 1
+            logger.debug("%s (%s) は 1 項目も取れなかった", document.doc_id, document.code)
+        session.commit()
+
+        if index % 500 == 0:
+            logger.info("%d / %d 件 (%d 行)", index, len(documents), total_rows)
+
+    return total_rows, empty

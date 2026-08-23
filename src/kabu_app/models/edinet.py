@@ -300,3 +300,64 @@ class EdinetShareholder(Base, TimestampMixin):
     is_owner: Mapped[bool] = mapped_column(
         Boolean, nullable=False, comment="オーナー系株主か。owner_ratio を出すときの合算対象"
     )
+
+
+class EdinetFinancial(Base, TimestampMixin):
+    """有報のファクトを名寄せした財務項目 1 つ.
+
+    ``edinet_facts`` が XBRL の要素名のままなのに対し、こちらは会社をまたいで比べられる
+    ``item`` に寄せてある。売上高は日本 GAAP・IFRS・鉄道会社の営業収益がすべて
+    ``net_sales`` に入る。
+
+    ``source_section`` と ``source_concept`` を必ず持つ。金融業の経常収益を売上高に寄せる
+    ような判断が入るため、出所を捨てると値がおかしいときに切り分けられない。
+
+    書類単位で持つ。訂正有報が来ても元とマージせず、期ごとの最新は
+    ``edinet_latest_financials`` が選ぶ。``edinet_facts`` と同じ考え方になる。
+
+    1 書類から複数期が入る。「主要な経営指標等」(BR) は 5 期分を載せるため、2026 年の
+    有報からは 2022 年の売上高まで取れる。EDINET API は直近 5 年しか遡れないので、
+    過去に伸ばす手として効く。営業利益だけは BR に無く PL からしか取れないため、
+    当期と前期の 2 期になる。
+    """
+
+    __tablename__ = "edinet_financials"
+    __table_args__ = (
+        Index("ix_edinet_financials_item_period_end", "item", "period_end"),
+        {"comment": "有価証券報告書のファクトを共通の財務項目に名寄せした値"},
+    )
+
+    doc_id: Mapped[str] = mapped_column(
+        String(16),
+        ForeignKey("edinet_documents.doc_id", ondelete="CASCADE"),
+        primary_key=True,
+        comment="EDINET 書類管理番号 (FK: edinet_documents.doc_id)",
+    )
+    item: Mapped[str] = mapped_column(
+        String(32),
+        primary_key=True,
+        comment="財務項目 (net_sales/operating_income/ordinary_income/net_income/"
+        "total_assets/net_assets)",
+    )
+    period_end: Mapped[date] = mapped_column(
+        Date, primary_key=True, comment="期間の末日、または時点の日付"
+    )
+    period_start: Mapped[date | None] = mapped_column(
+        Date, nullable=True, comment="期間の開始日。時点の項目 (総資産・純資産) では NULL"
+    )
+    value: Mapped[Decimal] = mapped_column(
+        Numeric, nullable=False, comment="値。円のまま入れる。丸めるのは表示側の仕事"
+    )
+    unit: Mapped[str | None] = mapped_column(
+        String(16), nullable=True, comment="単位 (JPY)。元のファクトのものをそのまま持つ"
+    )
+    source_section: Mapped[str] = mapped_column(
+        String(8),
+        nullable=False,
+        comment="どこから取ったか。BR: 経営指標の推移 / PL: 損益計算書 / BS: 貸借対照表",
+    )
+    source_concept: Mapped[str] = mapped_column(
+        String(512),
+        nullable=False,
+        comment="元の XBRL 要素名。名寄せの判断を後から検証するために必ず残す",
+    )

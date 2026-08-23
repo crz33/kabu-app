@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 毎晩の取得をまとめて回す。JPX → EDINET → EDINET 解析 → TDnet の順。
+# 毎晩の取得をまとめて回す。JPX → EDINET → 解析 → 名寄せ → TDnet の順。
 #
 #   0 1 * * * /home/takada/kabu-app/scripts/nightly.sh 2>&1 | /usr/bin/logger -t kabu
 #
@@ -14,6 +14,10 @@
 #
 # JPX を先頭に置くのは、新しく上場した銘柄を stocks に入れてから EDINET を取るため。
 # 月次更新のデータだが冪等で数秒なので、順序を保証するほうを取る。
+#
+# 名寄せは解析の直後に置く。edinet_facts から作るので、解析が入る前に走らせても空振りする。
+# 未処理の書類だけを見るため、毎晩の増分は数十件で数秒に収まる。項目の定義を変えたときは
+# ここではなく手で `kabu normalize financials --renormalize` を流すこと。全件で 9 分かかる。
 #
 # 途中で 1 つ落ちても後続は走らせる。TDnet は 31 日で消えるため、EDINET の失敗に
 # 巻き込まれて止まるのが一番痛い。失敗があれば終了コードで返す。
@@ -54,6 +58,7 @@ run() {
 run "JPX 銘柄一覧"   uv run kabu fetch jpx-stocks
 run "EDINET"        uv run kabu fetch edinet
 run "EDINET 解析"    uv run kabu parse edinet
+run "財務項目の名寄せ" uv run kabu normalize financials
 run "TDnet"         uv run kabu fetch tdnet
 run "株価の遡り"     uv run kabu fetch ticks --only-jumps --from 2024-01-04 --max-codes 50
 
