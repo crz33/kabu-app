@@ -1,8 +1,20 @@
 """TDnet の適時開示のメタデータ."""
 
 from datetime import date, datetime, time
+from decimal import Decimal
 
-from sqlalchemy import Boolean, Date, DateTime, Index, String, Time
+from sqlalchemy import (
+    Boolean,
+    Date,
+    DateTime,
+    ForeignKey,
+    Index,
+    Numeric,
+    SmallInteger,
+    String,
+    Text,
+    Time,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from kabu_app.models.base import Base, TimestampMixin
@@ -65,4 +77,191 @@ class TdnetDisclosure(Base, TimestampMixin):
         DateTime(timezone=True),
         nullable=True,
         comment="実体を保存した日時。NULL なら未取得。31 日を過ぎると取れなくなる",
+    )
+    accounting_standard: Mapped[str | None] = mapped_column(
+        String(16),
+        nullable=True,
+        comment="会計基準 (Japan GAAP / IFRS / US GAAP)。解析するまで NULL",
+    )
+    is_consolidated: Mapped[bool | None] = mapped_column(
+        Boolean,
+        nullable=True,
+        comment="連結の短信か。解析するまで NULL",
+    )
+    fiscal_year_end: Mapped[date | None] = mapped_column(
+        Date,
+        nullable=True,
+        comment="表紙から読んだ会計年度末。どの期の短信かを表す。解析するまで NULL",
+    )
+    quarter: Mapped[str | None] = mapped_column(
+        String(2),
+        nullable=True,
+        comment="四半期の区分 (Q1 / Q2 / Q3 / FY)。解析するまで NULL",
+    )
+    parsed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="iXBRL を解析した日時。NULL なら未解析で、次の実行が拾い直す",
+    )
+    parse_error: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="解析に失敗した理由。次の実行で解析し直すと消える。成功した書類は NULL",
+    )
+
+
+class TdnetSummaryFact(Base, TimestampMixin):
+    """決算短信の表紙から取り出した数値 1 つ.
+
+    表紙は ``tse-ed-t`` の独自体系で、有報とも添付の財務諸表とも要素名が重ならない。
+    ここを読むのは**会社予想**のためになる。予想は有報に無く、決算短信でしか取れない。
+
+    実績もここに載るが、値は ``scale="6"`` で百万円に丸めてある。同じ売上高が表紙で
+    138,877 (百万円)、添付で 138,877,139 (円) になる。実績は ``tdnet_statement_facts``
+    を使うこと。
+
+    ``context_ref`` を軸に割って列に持つ。有報の ``member`` と違い、短信の context は
+    意味の決まった軸の掛け合わせになっている。文字列のまま置くと、予想を引くたびに
+    ``LIKE '%ForecastMember'`` を書くことになる。
+    """
+
+    __tablename__ = "tdnet_summary_facts"
+    __table_args__ = (
+        Index("ix_tdnet_summary_facts_concept_period_end", "concept", "period_end"),
+        Index("ix_tdnet_summary_facts_fact_type", "fact_type"),
+        {"comment": "決算短信の表紙の数値 (実績と会社予想)"},
+    )
+
+    doc_id: Mapped[str] = mapped_column(
+        String(24),
+        ForeignKey("tdnet_disclosures.doc_id", ondelete="CASCADE"),
+        primary_key=True,
+        comment="TDnet 書類 ID (FK: tdnet_disclosures.doc_id)",
+    )
+    concept: Mapped[str] = mapped_column(
+        String(256),
+        primary_key=True,
+        comment="要素名 (例: tse-ed-t_NetSales)。表紙は tse-ed-t だけで会社独自の拡張は無い",
+    )
+    context_ref: Mapped[str] = mapped_column(
+        String(256), primary_key=True, comment="原文の context の id。軸に割る前のもの"
+    )
+    scope: Mapped[str] = mapped_column(
+        String(8), nullable=False, comment="Current (当期) / Prior (前期) / Next (来期)"
+    )
+    period_kind: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        comment="Year (通期) / AccumulatedQ1〜Q3 (四半期累計) など",
+    )
+    quarter_member: Mapped[str | None] = mapped_column(
+        String(32),
+        nullable=True,
+        comment="配当の内訳に付く FirstQuarter / YearEnd / Annual など。無ければ NULL",
+    )
+    is_consolidated: Mapped[bool | None] = mapped_column(
+        Boolean, nullable=True, comment="連結の値か。context に区分が無ければ NULL"
+    )
+    fact_type: Mapped[str | None] = mapped_column(
+        String(16),
+        nullable=True,
+        comment="Result (実績) / Forecast (会社予想) / Upper・Lower (予想レンジの上下限)",
+    )
+    period_type: Mapped[str] = mapped_column(
+        String(8), nullable=False, comment="duration (期間) か instant (時点) か"
+    )
+    period_start: Mapped[date | None] = mapped_column(
+        Date, nullable=True, comment="期間の開始日。instant では NULL"
+    )
+    period_end: Mapped[date] = mapped_column(
+        Date, nullable=False, comment="期間の末日、または時点の日付"
+    )
+    value: Mapped[Decimal] = mapped_column(
+        Numeric,
+        nullable=False,
+        comment="値。scale を掛けたあとの数。金額は円、比率は小数のまま",
+    )
+    unit: Mapped[str | None] = mapped_column(
+        String(24), nullable=True, comment="単位 (JPY / Pure / JPYPerShares / Shares)"
+    )
+    decimals: Mapped[str | None] = mapped_column(
+        String(8), nullable=True, comment="原文の精度表示。値のスケールとは関係しない"
+    )
+
+
+class TdnetStatementFact(Base, TimestampMixin):
+    """決算短信の添付にある財務諸表の数値 1 つ.
+
+    添付は ``jppfs_cor`` / ``jpigp_cor`` と**有報とまったく同じ体系**になる。だから
+    ``edinet_financials`` の名寄せがそのまま効く。有報が年 1 回なのに対し、こちらは
+    四半期ごとに入るので粒度が上がる。
+
+    値は円のまま入る。表紙と違って丸めが無い。
+
+    ``ordinal`` は iXBRL に出てくる順の通し番号。計算書ごとにファイルが分かれており、
+    出現順が刷られた並びと一致する。有報と違って ``depth`` は持たない。階層は同梱の
+    ``-pre.xml`` にあるので、要るようになったらそこから足せる。
+    """
+
+    __tablename__ = "tdnet_statement_facts"
+    __table_args__ = (
+        Index("ix_tdnet_statement_facts_concept_period_end", "concept", "period_end"),
+        Index("ix_tdnet_statement_facts_period_end", "period_end"),
+        {"comment": "決算短信の添付にある財務諸表の数値 (1 行 1 数値)"},
+    )
+
+    doc_id: Mapped[str] = mapped_column(
+        String(24),
+        ForeignKey("tdnet_disclosures.doc_id", ondelete="CASCADE"),
+        primary_key=True,
+        comment="TDnet 書類 ID (FK: tdnet_disclosures.doc_id)",
+    )
+    ordinal: Mapped[int] = mapped_column(
+        SmallInteger,
+        primary_key=True,
+        comment="書類を通した通し番号。計算書に刷られる順になる",
+    )
+    section: Mapped[str] = mapped_column(
+        String(4),
+        nullable=False,
+        comment="計算書。BS / PL / PC / CI / CF / SS / SG。IFRS の財政状態計算書は BS に寄せる",
+    )
+    concept: Mapped[str] = mapped_column(
+        String(512),
+        nullable=False,
+        comment="要素名 (例: jppfs_cor_NetSales)。有報と同じ体系で、会社独自の拡張も入る",
+    )
+    context_ref: Mapped[str] = mapped_column(
+        String(512), nullable=False, comment="XBRL の context の id。期間と区分を指す"
+    )
+    term: Mapped[str] = mapped_column(
+        String(1),
+        nullable=False,
+        comment="どの期の短信か。a (通期) / q (四半期) / s (中間)",
+    )
+    is_consolidated: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, comment="連結の計算書か。ファイル名の 2 文字目で決まる"
+    )
+    member: Mapped[str | None] = mapped_column(
+        String(512),
+        nullable=True,
+        comment="context_ref から期間の部分を除いた残り。全体の値は NULL",
+    )
+    period_type: Mapped[str] = mapped_column(
+        String(8), nullable=False, comment="duration (期間) か instant (時点) か"
+    )
+    period_start: Mapped[date | None] = mapped_column(
+        Date, nullable=True, comment="期間の開始日。instant では NULL"
+    )
+    period_end: Mapped[date] = mapped_column(
+        Date, nullable=False, comment="期間の末日、または時点の日付"
+    )
+    value: Mapped[Decimal] = mapped_column(
+        Numeric, nullable=False, comment="値。円のまま入れる。丸めるのは表示側の仕事"
+    )
+    unit: Mapped[str | None] = mapped_column(
+        String(24), nullable=True, comment="単位 (JPY / Pure / JPYPerShares / Shares)"
+    )
+    decimals: Mapped[str | None] = mapped_column(
+        String(8), nullable=True, comment="原文の精度表示。値のスケールとは関係しない"
     )

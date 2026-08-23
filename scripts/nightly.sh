@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 毎晩の取得をまとめて回す。JPX → EDINET → 解析 → 名寄せ → TDnet の順。
+# 毎晩の取得をまとめて回す。JPX → EDINET → 解析 → 名寄せ → TDnet → 解析 の順。
 #
 #   0 1 * * * /home/takada/kabu-app/scripts/nightly.sh 2>&1 | /usr/bin/logger -t kabu
 #
@@ -60,6 +60,7 @@ run "EDINET"        uv run kabu fetch edinet
 run "EDINET 解析"    uv run kabu parse edinet
 run "財務項目の名寄せ" uv run kabu normalize financials
 run "TDnet"         uv run kabu fetch tdnet
+run "TDnet 解析"     uv run kabu parse tdnet
 run "株価の遡り"     uv run kabu fetch ticks --only-jumps --from 2024-01-04 --max-codes 50
 
 if [ ${#failed[@]} -gt 0 ]; then

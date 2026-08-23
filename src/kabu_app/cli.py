@@ -31,10 +31,11 @@ from kabu_app.collectors.yahoo import REQUEST_INTERVAL as YAHOO_REQUEST_INTERVAL
 from kabu_app.collectors.yahoo import YahooPageError, create_client, fetch_quotes, iter_periods
 from kabu_app.config import get_settings
 from kabu_app.db import create_session_factory, session_scope
-from kabu_app.models import EdinetDocument
+from kabu_app.models import EdinetDocument, TdnetDisclosure
 from kabu_app.normalizers.financials import ITEMS, normalize
 from kabu_app.parsers import EdinetXbrlError, parse_document, parse_shareholders
 from kabu_app.parsers.taxonomy import parse_taxonomy_labels, taxonomy_path
+from kabu_app.parsers.tdnet_xbrl import TdnetXbrlError, parse_disclosure
 from kabu_app.stores.edinet import (
     latest_submit_date,
     load_documents,
@@ -63,6 +64,14 @@ from kabu_app.stores.tdnet import (
     pending_disclosures,
 )
 from kabu_app.stores.tdnet import mark_downloaded as mark_tdnet_downloaded
+from kabu_app.stores.tdnet_fact import (
+    disclosures_by_id,
+    mark_no_xbrl,
+    save_statement_facts,
+    save_summary_facts,
+    unparsed_disclosures,
+)
+from kabu_app.stores.tdnet_fact import mark_parsed as mark_tdnet_parsed
 from kabu_app.stores.tick import (
     codes_with_price_jumps,
     earliest_dates,
@@ -824,3 +833,126 @@ def _normalize_documents(session: Session, documents: Sequence[EdinetDocument]) 
             logger.info("%d / %d 件 (%d 行)", index, len(documents), total_rows)
 
     return total_rows, empty
+
+
+@parse_app.command("tdnet")
+def parse_tdnet(
+    max_disclosures: Annotated[
+        int | None,
+        typer.Option("--max-disclosures", help="1 回の実行で解析する開示数の上限"),
+    ] = None,
+    reparse: Annotated[
+        bool,
+        typer.Option("--reparse", help="解析済みの開示もやり直す。パーサを直したとき用"),
+    ] = False,
+    doc_ids: Annotated[
+        str | None,
+        typer.Option("--doc-id", help="書類 ID をカンマ区切りで指定する。解析済みでもやり直す"),
+    ] = None,
+) -> None:
+    """取得済みの決算短信を解析して tdnet_summary_facts と tdnet_statement_facts に入れる.
+
+    ZIP には体系のまったく違う 2 系統が入っている。表紙 (Summary) は tse-ed-t の独自体系で
+    **会社予想**が載る。予想は有報に無く、決算短信でしか取れない。添付 (Attachment) は
+    jppfs_cor / jpigp_cor と有報とまったく同じ体系で、内訳と円単位の精度がある。
+
+    実績は添付を使うこと。表紙の数値は百万円に丸めてあり、同じ売上高が表紙で 138,877、
+    添付で 138,877,139 になる。
+
+    書類単位で消してから入れ直すので、同じ開示を 2 回解析しても壊れない。失敗した開示は
+    parsed_at が空のまま残り、次の実行が拾い直す。
+
+    XBRL の付かない短信は最初から対象にしない。決算短信の 1 割ほどが PDF だけで、数値は
+    どうやっても取れない。
+    """
+    settings = get_settings()
+
+    with session_scope(create_session_factory(settings.database_url)) as session:
+        if doc_ids is not None:
+            disclosures = disclosures_by_id(
+                session, [part.strip() for part in doc_ids.split(",") if part.strip()]
+            )
+        else:
+            disclosures = unparsed_disclosures(
+                session, limit=max_disclosures, include_parsed=reparse
+            )
+        if not disclosures:
+            logger.info("解析する開示がありません")
+            return
+
+        logger.info("解析する開示が %d 件", len(disclosures))
+        parsed, failed, summary, statement = _parse_disclosures(
+            session, disclosures, settings.kabu_data_dir
+        )
+
+    logger.info(
+        "完了: %d 件解析 (失敗 %d 件) / 表紙 %d 行 / 財務諸表 %d 行",
+        parsed,
+        failed,
+        summary,
+        statement,
+    )
+
+
+def _parse_disclosures(
+    session: Session, disclosures: Sequence[TdnetDisclosure], data_dir: Path
+) -> tuple[int, int, int, int]:
+    """開示を 1 件ずつ解析して書き込む. 戻りは (成功, 失敗, 表紙行, 財務諸表行)."""
+    parsed = 0
+    failed = 0
+    total_summary = 0
+    total_statement = 0
+    consecutive_failures = 0
+
+    for index, disclosure in enumerate(disclosures, start=1):
+        path = disclosure_path(data_dir, disclosure.doc_id, disclosure.disclosed_date, "zip")
+        try:
+            summary, statement = _parse_one_disclosure(session, disclosure, path)
+        except (TdnetXbrlError, zipfile.BadZipFile, OSError, ValueError) as error:
+            failed += 1
+            consecutive_failures += 1
+            logger.warning("%s の解析に失敗: %s", disclosure.doc_id, error)
+            session.rollback()
+            mark_tdnet_parsed(session, disclosure.doc_id, error=f"{type(error).__name__}: {error}")
+            session.commit()
+            if consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+                # ZIP の置き場ごと見えていないなど、続けても直らない壊れ方をしている。
+                logger.error("%d 件続けて失敗したため中断する", consecutive_failures)
+                break
+            continue
+
+        session.commit()
+        parsed += 1
+        total_summary += summary
+        total_statement += statement
+        consecutive_failures = 0
+
+        if index % 500 == 0:
+            logger.info(
+                "%d / %d 件 (表紙 %d 行 / 財務諸表 %d 行)",
+                index,
+                len(disclosures),
+                total_summary,
+                total_statement,
+            )
+
+    return parsed, failed, total_summary, total_statement
+
+
+def _parse_one_disclosure(
+    session: Session, disclosure: TdnetDisclosure, path: Path
+) -> tuple[int, int]:
+    """1 件を解析して書き込む. コミットは呼び出し側.
+
+    ZIP が無いのは失敗ではない。決算短信の 1 割ほどに XBRL が付かず、PDF だけになる。
+    解析済みとして片付け、次の実行が拾い直さないようにする。
+    """
+    if not path.exists():
+        mark_no_xbrl(session, disclosure.doc_id)
+        return 0, 0
+
+    parsed = parse_disclosure(path)
+    summary = save_summary_facts(session, disclosure.doc_id, parsed.summary_facts)
+    statement = save_statement_facts(session, disclosure.doc_id, parsed.statement_facts)
+    mark_tdnet_parsed(session, disclosure.doc_id, info=parsed.info)
+    return summary, statement
