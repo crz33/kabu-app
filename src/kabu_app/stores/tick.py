@@ -6,7 +6,7 @@
 import logging
 from collections.abc import Iterator, Sequence
 from dataclasses import asdict
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -90,7 +90,26 @@ def save_quotes(session: Session, quotes: Sequence[DailyQuote]) -> int:
     return len(unique)
 
 
-def codes_with_price_jumps(session: Session, threshold: float = 0.55) -> list[str]:
+RETRY_INTERVAL = timedelta(days=180)
+"""飛びのある銘柄を取り直してから、次に候補へ戻すまでの間隔.
+
+閾値に引っかかる値動きが実際に起きる。低位株なら 1 日で 1.8 倍は普通で、取り直しても飛びは
+消えない。そういう銘柄がコード順の先頭に居座ると、毎晩 50 件の枠を食い続ける。
+
+``adjusted_close`` が入っているかどうかでは判別できない。日次の差分取得でも入るためで、
+「取り直した」ことの証拠にならない。2025 年 1 月に差分で入った行に、その後 6 月の分割が
+反映されないまま残る、という漏れ方をする。
+
+そこで時間で見る。半年おけば分割はたいてい 1 回あるかないかで、見落としても次の機会に拾える。
+時間に頼るからこそ、判定を誤っても自己修復する。
+"""
+
+
+def codes_with_price_jumps(
+    session: Session,
+    threshold: float = 0.55,
+    retry_interval: timedelta = RETRY_INTERVAL,
+) -> list[str]:
     """調整後終値が前日から大きく飛んでいる銘柄を返す.
 
     見るのは close ではなく調整後の値。close は分割の日に必ず飛ぶが、それは正常な動き。
@@ -98,10 +117,19 @@ def codes_with_price_jumps(session: Session, threshold: float = 0.55) -> list[st
 
     adjusted_close が NULL の行は close で代用する。移した行と取り直した行を同じ式で
     判定できる。実際の暴落や併合とは区別がつかないので、洗い直しの候補として見る。
+
+    最近取り直した銘柄は外す。``retry_interval`` のあいだ空ける。飛びのあった日の行の
+    ``updated_at`` で見るので、進捗を別に持たなくてよい。日次の差分取得は過去の行を触らない
+    ため、取り直したときだけこの日付が動く。
     """
     price = func.coalesce(Tick.adjusted_close, Tick.close)
     previous = func.lag(price).over(partition_by=Tick.code, order_by=Tick.date)
-    inner = select(Tick.code, price.label("price"), previous.label("previous")).subquery()
+    inner = select(
+        Tick.code,
+        price.label("price"),
+        previous.label("previous"),
+        Tick.updated_at.label("updated_at"),
+    ).subquery()
 
     statement = (
         select(inner.c.code)
@@ -109,6 +137,7 @@ def codes_with_price_jumps(session: Session, threshold: float = 0.55) -> list[st
             inner.c.previous.is_not(None),
             (inner.c.price < inner.c.previous * threshold)
             | (inner.c.price > inner.c.previous / threshold),
+            inner.c.updated_at < datetime.now(UTC) - retry_interval,
         )
         .distinct()
         .order_by(inner.c.code)

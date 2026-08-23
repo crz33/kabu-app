@@ -4,7 +4,7 @@
 """
 
 from dataclasses import replace
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 
 from sqlalchemy import text
@@ -134,7 +134,7 @@ def test_調整が行き届いていない銘柄を洗い出す(session: Session
     )
     session.execute(text("UPDATE ticks SET adjusted_close = NULL"))
 
-    assert codes_with_price_jumps(session) == ["2961"]
+    assert codes_with_price_jumps(session, retry_interval=timedelta(0)) == ["2961"]
 
 
 def test_調整されていれば分割の日でも飛びとみなさない(session: Session) -> None:
@@ -157,7 +157,7 @@ def test_調整されていれば分割の日でも飛びとみなさない(sess
         ],
     )
 
-    assert codes_with_price_jumps(session) == []
+    assert codes_with_price_jumps(session, retry_interval=timedelta(0)) == []
 
 
 def test_併合で跳ね上がった銘柄も拾う(session: Session) -> None:
@@ -171,4 +171,89 @@ def test_併合で跳ね上がった銘柄も拾う(session: Session) -> None:
     )
     session.execute(text("UPDATE ticks SET adjusted_close = NULL"))
 
-    assert codes_with_price_jumps(session) == ["1234"]
+    assert codes_with_price_jumps(session, retry_interval=timedelta(0)) == ["1234"]
+
+
+def test_最近取り直した銘柄は候補から外す(session: Session) -> None:
+    """閾値に引っかかる値動きは実際に起きる. 低位株なら 1 日で 1.8 倍は普通になる.
+
+    そういう銘柄がコード順の先頭に居座ると、毎晩 50 件の枠を食い続ける。
+    """
+    save_quotes(
+        session,
+        [
+            replace(
+                _BASE,
+                code="2586",
+                date=date(2026, 8, 20),
+                close=Decimal("36"),
+                adjusted_close=Decimal("36"),
+            ),
+            replace(
+                _BASE,
+                code="2586",
+                date=date(2026, 8, 21),
+                close=Decimal("66"),
+                adjusted_close=Decimal("66"),
+            ),
+        ],
+    )
+    session.flush()
+
+    # 入れたばかりなので updated_at は今。半年の間隔では候補にならない
+    assert codes_with_price_jumps(session) == []
+    # 間隔を 0 にすれば飛びとして見える
+    assert codes_with_price_jumps(session, retry_interval=timedelta(0)) == ["2586"]
+
+
+def test_取り直してから半年たてば候補に戻る(session: Session) -> None:
+    """判定を誤っても時間で自己修復する. 見落とした分割を次の機会に拾える."""
+    save_quotes(
+        session,
+        [
+            replace(
+                _BASE,
+                code="2586",
+                date=date(2026, 8, 20),
+                close=Decimal("36"),
+                adjusted_close=Decimal("36"),
+            ),
+            replace(
+                _BASE,
+                code="2586",
+                date=date(2026, 8, 21),
+                close=Decimal("66"),
+                adjusted_close=Decimal("66"),
+            ),
+        ],
+    )
+    session.execute(text("UPDATE ticks SET updated_at = now() - interval '200 days'"))
+    session.flush()
+
+    assert codes_with_price_jumps(session) == ["2586"]
+
+
+def test_日次で入った行も間隔をあける(session: Session) -> None:
+    """adjusted_close の有無では取り直したか判別できない.
+
+    日次の差分取得でも入るため、「取り直した」ことの証拠にならない。時間で見れば
+    どちらの入り方でも同じ扱いになる。
+    """
+    save_quotes(
+        session,
+        [
+            replace(
+                _BASE,
+                code="2586",
+                date=date(2026, 8, 20),
+                close=Decimal("36"),
+                adjusted_close=Decimal("36"),
+            ),
+            replace(
+                _BASE, code="2586", date=date(2026, 8, 21), close=Decimal("66"), adjusted_close=None
+            ),
+        ],
+    )
+    session.flush()
+
+    assert codes_with_price_jumps(session) == []
