@@ -138,15 +138,18 @@ uv run alembic upgrade head --sql    # DB に触らず SQL を確認
 | `tdnet_disclosures` | TDnet の決算短信・訂正短信のメタデータ。実体と解析の状況も持つ |
 | `tdnet_summary_facts` | 決算短信の表紙の数値。実績と**会社予想**。予想はここにしか無い |
 | `tdnet_statement_facts` | 決算短信の添付にある財務諸表の数値。有報と同じ体系で四半期ごと |
+| `tdnet_financials` | 添付を共通の財務項目に名寄せした値。有報と同じ 6 項目を四半期で |
 | `ticks` | 日次の四本値と出来高。調整後終値も持つ。市場指数も同じ表に入る |
 
-ビューが 3 つある。
+ビューが 5 つある。
 
 | ビュー | 中身 |
 | --- | --- |
 | `edinet_statement_lines` | `edinet_facts` にラベルを結合したもの。`ORDER BY ordinal` で計算書の形になる |
 | `edinet_latest_facts` | 銘柄と期ごとに、いちばん新しい書類のファクトだけを残したもの |
-| `edinet_latest_financials` | 銘柄・項目・期ごとに 1 行だけを残した財務項目 |
+| `edinet_latest_financials` | 銘柄・項目・期ごとに 1 行だけを残した有報の財務項目 |
+| `financials` | 有報と短信の財務項目を縦に並べたもの。同じ期が何行も出る |
+| `latest_financials` | 上を銘柄・項目・期ごとに 1 行へ絞ったもの |
 
 JPX の銘柄一覧 (`data_j.xls`) には `日付` 列があり、これが基準日になる。JPX は月末時点のデータを 1 か月ほど遅れて公開するため、取得日とは一致しない。`stock_snapshots.base_date` にはこの `日付` 列を使う。
 
@@ -600,6 +603,102 @@ iXBRL の数値は原文のまま置かれ、桁と符号が属性で別に来�
 刷られているので掛けて円に直す。`sign="-"` は表に △ で刷られる値に付き、実測 60 書類で
 488 件あった。落とすと赤字が黒字のまま入る。
 
+## 短信の財務項目の名寄せ
+
+添付を有報と同じ 6 項目に寄せて `tdnet_financials` に入れる。
+
+```bash
+uv run kabu normalize tdnet-financials                      # 未処理の開示をすべて
+uv run kabu normalize tdnet-financials --max-disclosures 100
+uv run kabu normalize tdnet-financials --renormalize        # 済みもやり直す
+```
+
+**項目の定義は有報と共有する。** 添付は `jppfs_cor` / `jpigp_cor` と有報とまったく同じ体系
+なので、`normalizers.financials.ITEM_SPECS` がそのまま効く。実測では PL / BS のエントリ
+18 個のうち 15 個が短信でも当たり、売上の取りこぼしは無かった。定義を 2 つ持つと片方だけ
+直す事故が起きる。
+
+### 累計と単独四半期を取り違えない
+
+有報は `period_end` だけで期が決まった。短信は同じ期末に**年初来累計と単独四半期**が並ぶ。
+「Q2 累計 100 億」と「Q2 単独 50 億」は別物なので、`period_kind` を主キーに含める。
+
+| `period_kind` | context | 中身 |
+| --- | --- | --- |
+| `ytd` | `CurrentYTDDuration` | 年初来累計。四半期短信の主軸 |
+| `quarter` | `CurrentQuarterDuration` | 単独四半期。出す会社は少ない |
+| `year` | `CurrentYearDuration` | 通期 |
+| `interim` | `InterimDuration` | 中間期 |
+| `quarter_end` | `CurrentQuarterInstant` | 四半期末の時点。BS |
+| `year_end` | `Prior1YearInstant` など | 期末の時点。BS |
+
+`period_start` から期間の長さを計算しても大半は判別できる。しかし決算期を変えた会社で狂う。
+実際に「第５四半期決算短信」を出す会社がある。context に書いてあるものを読む。
+
+`period_kind` は context の最初の `_` より前だけを見る。単体決算の会社は
+`CurrentQuarterInstant_NonConsolidatedMember` の形になり、末尾で合わせると 763 書類が丸ごと
+落ちる。
+
+### 絞りには 2 つの軸が要る
+
+添付はファイルが連結と単体で分かれており、その中の context にも区分が入る。連結企業は連結の
+ファイルを見て `member IS NULL` を採る。単体決算の会社は `NonConsolidatedMember` も通す。
+実測 763 書類では `member IS NULL` の行が書類あたり 1 つしかなく、中身は提出回数の DEI
+だった。**有報とまったく同じ構造**になる。
+
+`pc` の計算書は名寄せのときだけ `PL` に寄せる。どちらも損益計算書で中身は同じ要素になる。
+実測では `pc` だけを持つ書類が 136 件あり、落とすとその会社がまるごと空になる。
+
+### 検証
+
+800 件で試して 1 項目も取れない開示は 2 件 (0.25%) だった。名寄せた売上高を表紙の実績と
+突き合わせると 656 件中 655 件 (99.8%) が一致し、残る 1 件は会社側の記載ミスで訂正短信が
+出ているものだった。
+
+## 有報と短信をまとめて引く
+
+同じ 6 項目が両方から取れる。引くたびにどちらを見るか考えないで済むよう、ビューを 2 枚
+用意してある。年次は有報、四半期は短信という分担になる。
+
+| ビュー | 用途 |
+| --- | --- |
+| `financials` | 報告のぜんぶ。同じ期が何行も出る。**ある時点で何が分かっていたか**を再現する |
+| `latest_financials` | 期ごとに 1 行。今の姿を見る |
+
+`latest_financials` は同じ期を両方が報告していたら有報を採る。監査を通った確定値だから。
+通期の短信が出てから有報が出るまで 1.5 か月ほどあり、その間は短信しか無いのでそこは短信を
+採る。
+
+```sql
+SELECT period_kind, period_end, value / 1e6 AS 百万円, source
+FROM latest_financials
+WHERE code = '7203' AND item = 'net_sales'
+ORDER BY period_end DESC;
+```
+
+### 時点の再現には `financials` を使う
+
+`available_at` は「この値がこの書類で報告された日」を表す。有報の提出日と短信の開示日になる。
+決算日から短信まで 45 日、有報まで 3 か月あるので、決算期末の日付で引くと存在しない情報を
+使うことになる。
+
+```sql
+-- 2025-08-01 の時点で分かっていた直近の年次売上
+SELECT DISTINCT ON (code) code, period_end, value, available_at
+FROM financials
+WHERE item = 'net_sales' AND period_kind = 'year' AND available_at <= '2025-08-01'
+ORDER BY code, period_end DESC, available_at DESC;
+```
+
+**`latest_financials` でこれをやってはいけない。** 有報は「主要な経営指標等」に 5 期分を
+載せるので、同じ期を何通もの書類が報告する。期ごとに 1 行へ絞ると、2019 年 3 月期の売上が
+「2025 年の有報で報告された」形になり、`available_at` が 2025 年になる。実際には 2019 年
+6 月に分かっていた。これで絞ると 2020 年時点の判定で 2019 年の売上が使えない。
+
+遡れる範囲には限りがある。EDINET の取得は 2025-01-06 から始めたので、それ以前に提出された
+書類は入っていない。2024 年より前の期のデータは「2025 年以降の書類が報告した過去の期」
+として入っており、その期の当時の報告そのものではない。
+
 ### findocgen からのメタデータ移行
 
 過去分は TDnet から取り直せない。ZIP は `/mnt/usb/data/tdnet/` に 25773 件残っているが、
@@ -708,7 +807,7 @@ journalctl -t kabu-ticks -n 50
 
 ### 毎晩 01:00
 
-JPX → EDINET → 解析 → 名寄せ → TDnet → 解析 → 株価の遡り の順に回る。所要は 20〜105 分。
+JPX → EDINET → 解析 → 名寄せ → TDnet → 解析 → 名寄せ → 株価の遡り の順に回る。所要は 20〜105 分。
 
 | 順 | 処理 | 所要 |
 | --- | --- | --- |
@@ -718,13 +817,14 @@ JPX → EDINET → 解析 → 名寄せ → TDnet → 解析 → 株価の遡り
 | 4 | 財務項目の名寄せ | 数秒 |
 | 5 | TDnet | 5〜30 分 (決算期のピークで) |
 | 6 | TDnet 解析 | 1〜10 分 (決算期のピークで) |
-| 7 | 株価の遡り (50 銘柄) | 65 分 |
+| 7 | 短信の名寄せ | 数秒 |
+| 8 | 株価の遡り (50 銘柄) | 65 分 |
 
-4 は解析の直後に置く。`edinet_facts` から作るので、解析が入る前に走らせても空振りする。
-未処理の書類だけを見るため、毎晩の増分は数十件で数秒に収まる。項目の定義を変えたときは
-バッチ任せにせず、手で `kabu normalize financials --renormalize` を流すこと。全件で 9 分。
+4 と 7 の名寄せは解析の直後に置く。ファクトから作るので、解析が入る前に走らせても空振り
+する。未処理のぶんだけを見るため、毎晩の増分は数十件で数秒に収まる。項目の定義を変えたときは
+バッチ任せにせず、手で `--renormalize` を流すこと。有報の全件で 9 分かかる。
 
-7 は株式分割で調整が狂った銘柄の取り直し。1 晩 50 銘柄に絞ってある。遡りは 1 銘柄で
+8 は株式分割で調整が狂った銘柄の取り直し。1 晩 50 銘柄に絞ってある。遡りは 1 銘柄で
 40 ページ近く叩くので、まとめて流すと Yahoo に締められる。対象が尽きれば 0 件で即座に
 終わるので、片付いたあとも置いたままでよい。
 

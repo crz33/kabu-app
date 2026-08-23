@@ -4,15 +4,21 @@
 ここは短信固有の期の数え方を見る。
 """
 
-from datetime import date
+from datetime import date, time, timedelta
 from decimal import Decimal
 
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from kabu_app.collectors.edinet import EdinetDocumentMeta
+from kabu_app.collectors.tdnet import TdnetDisclosureMeta
 from kabu_app.normalizers.financials import (
     NET_ASSETS,
     NET_SALES,
     OPERATING_INCOME,
     TOTAL_ASSETS,
 )
+from kabu_app.normalizers.financials import FinancialValue as EdinetFinancialValue
 from kabu_app.normalizers.tdnet_financials import (
     INTERIM,
     QUARTER,
@@ -20,10 +26,17 @@ from kabu_app.normalizers.tdnet_financials import (
     YEAR,
     YEAR_END,
     YTD,
+    FinancialValue,
     SourceFact,
     normalize,
     period_kind_of,
 )
+from kabu_app.parsers.edinet_xbrl import DocumentInfo
+from kabu_app.stores.edinet import load_documents
+from kabu_app.stores.edinet_fact import mark_parsed as mark_edinet_parsed
+from kabu_app.stores.edinet_financial import save_financials
+from kabu_app.stores.tdnet import load_disclosures
+from kabu_app.stores.tdnet_fact import save_tdnet_financials
 
 
 def _fact(
@@ -191,3 +204,187 @@ def test_単体決算の書類も名寄せできる() -> None:
         (NET_SALES, YTD),
         (TOTAL_ASSETS, QUARTER_END),
     }
+
+
+def test_有報と短信が1枚に並ぶ(session: Session) -> None:
+    """financials は報告のぜんぶを縦に並べる. 同じ期が何行も出る."""
+    _edinet_row(session, period_end=date(2025, 3, 31), value=1000, submit_date=date(2025, 6, 20))
+    _tdnet_row(session, kind=YTD, period_end=date(2025, 9, 30), value=600)
+    session.flush()
+
+    rows = session.execute(
+        text(
+            "SELECT period_kind, value, source, available_at FROM financials"
+            " WHERE code = :code AND item = 'net_sales' ORDER BY period_end"
+        ),
+        {"code": _CODE},
+    ).all()
+
+    assert [(r[0], int(r[1]), r[2]) for r in rows] == [
+        ("year", 1000, "edinet"),
+        (YTD, 600, "tdnet"),
+    ]
+
+
+def test_同じ期は有報を採る(session: Session) -> None:
+    """監査を通った確定値だから. 短信が先に出ていても有報で上書きされる."""
+    _edinet_row(session, period_end=date(2025, 3, 31), value=1000, submit_date=date(2025, 6, 20))
+    _tdnet_row(session, kind="year", period_end=date(2025, 3, 31), value=999)
+    session.flush()
+
+    rows = session.execute(
+        text(
+            "SELECT source, value FROM latest_financials"
+            " WHERE code = :code AND item = 'net_sales' AND period_kind = 'year'"
+        ),
+        {"code": _CODE},
+    ).all()
+
+    assert [(r[0], int(r[1])) for r in rows] == [("edinet", 1000)]
+
+
+def test_有報がまだ無い期は短信を採る(session: Session) -> None:
+    """通期の短信が出てから有報が出るまで 1.5 か月ある."""
+    _tdnet_row(session, kind="year", period_end=date(2026, 3, 31), value=1200)
+    session.flush()
+
+    rows = session.execute(
+        text(
+            "SELECT source, value FROM latest_financials"
+            " WHERE code = :code AND item = 'net_sales' AND period_kind = 'year'"
+        ),
+        {"code": _CODE},
+    ).all()
+
+    assert [(r[0], int(r[1])) for r in rows] == [("tdnet", 1200)]
+
+
+def test_時点で絞ると当時の報告が残る(session: Session) -> None:
+    """有報は 5 期分を載せるので、同じ期を何通もの書類が報告する.
+
+    期ごとに 1 行へ絞ってしまうと available_at が新しい書類のものになり、
+    「2020 年時点で 2019 年の売上が使えない」ことになる。
+    """
+    _edinet_row(session, period_end=date(2025, 3, 31), value=1000, submit_date=date(2025, 6, 20))
+    # 翌年の有報が前期分として同じ期を報告し直す
+    _edinet_row(
+        session,
+        period_end=date(2025, 3, 31),
+        value=1000,
+        submit_date=date(2026, 6, 20),
+        doc_id="S100LATER",
+    )
+    session.flush()
+
+    at_2025 = session.execute(
+        text(
+            "SELECT count(*) FROM financials WHERE code = :code AND item = 'net_sales'"
+            " AND available_at <= '2025-12-31'"
+        ),
+        {"code": _CODE},
+    ).scalar_one()
+    latest = session.execute(
+        text("SELECT count(*) FROM latest_financials WHERE code = :code AND item = 'net_sales'"),
+        {"code": _CODE},
+    ).scalar_one()
+
+    assert at_2025 == 1
+    assert latest == 1
+
+
+_CODE = "9999"
+
+
+def _edinet_row(
+    session: Session,
+    period_end: date,
+    value: int,
+    submit_date: date,
+    doc_id: str = "S100TEST0",
+) -> None:
+    """有報 1 件と、その名寄せ結果 1 行を入れる."""
+    load_documents(
+        session,
+        [
+            EdinetDocumentMeta(
+                doc_id=doc_id,
+                edinet_code="E00000",
+                sec_code=f"{_CODE}0",
+                code=_CODE,
+                doc_type_code="120",
+                parent_doc_id=None,
+                submit_date=submit_date,
+                submitted_at=None,
+                period_end=period_end,
+                filer_name="テスト株式会社",
+                doc_description="有価証券報告書",
+                has_xbrl=True,
+                is_withdrawn=False,
+            )
+        ],
+    )
+    mark_edinet_parsed(
+        session,
+        doc_id,
+        info=DocumentInfo(
+            sec_code=f"{_CODE}0",
+            filer_name="テスト株式会社",
+            accounting_standard="Japan GAAP",
+            is_consolidated=True,
+            fiscal_year_start=date(period_end.year - 1, period_end.month, 1),
+            fiscal_year_end=period_end,
+        ),
+    )
+    save_financials(
+        session,
+        doc_id,
+        [
+            EdinetFinancialValue(
+                item=NET_SALES,
+                period_start=date(period_end.year - 1, 4, 1),
+                period_end=period_end,
+                value=Decimal(value),
+                unit="JPY",
+                source_section="BR",
+                source_concept="jpcrp_cor_NetSalesSummaryOfBusinessResults",
+            )
+        ],
+    )
+
+
+def _tdnet_row(session: Session, kind: str, period_end: date, value: int) -> None:
+    """短信 1 件と、その名寄せ結果 1 行を入れる."""
+    doc_id = f"TD{kind}{period_end:%Y%m%d}"[:24]
+    load_disclosures(
+        session,
+        [
+            TdnetDisclosureMeta(
+                doc_id=doc_id,
+                disclosed_date=date(period_end.year, period_end.month, 1) + timedelta(days=44),
+                disclosed_time=time(15, 0),
+                sec_code=f"{_CODE}0",
+                code=_CODE,
+                company_name="テスト株式会社",
+                title="決算短信",
+                markets="東",
+                is_amendment=False,
+                xbrl_file=f"{doc_id}.zip",
+            )
+        ],
+    )
+    save_tdnet_financials(
+        session,
+        doc_id,
+        [
+            FinancialValue(
+                item=NET_SALES,
+                period_kind=kind,
+                period_start=date(period_end.year, 4, 1),
+                period_end=period_end,
+                value=Decimal(value),
+                unit="JPY",
+                source_section="PL",
+                source_concept="jppfs_cor_NetSales",
+            )
+        ],
+    )
