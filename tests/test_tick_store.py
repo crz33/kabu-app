@@ -7,16 +7,18 @@ from dataclasses import replace
 from datetime import date
 from decimal import Decimal
 
-from sqlalchemy import text
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from kabu_app.collectors.yahoo import DailyQuote
-from kabu_app.models import Stock, Tick
+from kabu_app.models import Stock, Tick, TickJumpCheck
 from kabu_app.stores.tick import (
     codes_with_price_jumps,
     earliest_dates,
     latest_prices,
     listed_codes,
+    price_jumps,
+    save_jump_checks,
     save_quotes,
 )
 
@@ -172,3 +174,90 @@ def test_併合で跳ね上がった銘柄も拾う(session: Session) -> None:
     session.execute(text("UPDATE ticks SET adjusted_close = NULL"))
 
     assert codes_with_price_jumps(session) == ["1234"]
+
+
+def _low_priced_jump(session: Session) -> None:
+    """5103 の 3 円 → 1 円。低位株は 1 円刻みなので取り直しても消えない."""
+    save_quotes(
+        session,
+        [
+            _quote(
+                code="5103",
+                date=date(2026, 8, 20),
+                close=Decimal("3"),
+                adjusted_close=Decimal("3"),
+            ),
+            _quote(
+                code="5103",
+                date=date(2026, 8, 21),
+                close=Decimal("1"),
+                adjusted_close=Decimal("1"),
+            ),
+        ],
+    )
+
+
+def test_飛びの箇所を銘柄と日で返す(session: Session) -> None:
+    """記録に入れる単位。銘柄だけでは、同じ銘柄の別の飛びと区別できない."""
+    _low_priced_jump(session)
+
+    assert price_jumps(session) == [("5103", date(2026, 8, 21))]
+
+
+def test_確認済みの飛びは対象から外れる(session: Session) -> None:
+    """取り直しても消えない飛びを記録して、毎晩の取り直しを止める."""
+    _low_priced_jump(session)
+    assert codes_with_price_jumps(session) == ["5103"]
+
+    save_jump_checks(session, [("5103", date(2026, 8, 21))])
+
+    assert codes_with_price_jumps(session) == []
+
+
+def test_確認済みでも同じ銘柄の別の日は拾う(session: Session) -> None:
+    """記録は箇所ごと。分割の取りこぼしが後から起きても気づける."""
+    _low_priced_jump(session)
+    save_quotes(
+        session,
+        [
+            _quote(
+                code="5103",
+                date=date(2026, 8, 24),
+                close=Decimal("4"),
+                adjusted_close=Decimal("4"),
+            ),
+        ],
+    )
+    save_jump_checks(session, [("5103", date(2026, 8, 21))])
+
+    assert codes_with_price_jumps(session) == ["5103"]
+
+
+def test_確認済みでも飛びの箇所としては返る(session: Session) -> None:
+    """price_jumps は除外しない。記録の updated_at を伸ばすために毎回入れ直す."""
+    _low_priced_jump(session)
+    save_jump_checks(session, [("5103", date(2026, 8, 21))])
+
+    assert price_jumps(session) == [("5103", date(2026, 8, 21))]
+
+
+def test_同じ箇所を2回記録しても1行のまま(session: Session) -> None:
+    save_jump_checks(session, [("5103", date(2026, 8, 21))])
+    save_jump_checks(session, [("5103", date(2026, 8, 21))])
+
+    assert session.scalar(select(func.count()).select_from(TickJumpCheck)) == 1
+
+
+def test_銘柄を指定すると他の銘柄は見ない(session: Session) -> None:
+    """--max-codes で後回しにした銘柄を記録しないため、取り直したぶんだけ渡す."""
+    _low_priced_jump(session)
+    save_quotes(
+        session,
+        [
+            _quote(code="1234", date=date(2026, 8, 20), close=Decimal("100")),
+            _quote(code="1234", date=date(2026, 8, 21), close=Decimal("1000")),
+        ],
+    )
+    session.execute(text("UPDATE ticks SET adjusted_close = NULL WHERE code = '1234'"))
+
+    assert price_jumps(session, codes=["5103"]) == [("5103", date(2026, 8, 21))]

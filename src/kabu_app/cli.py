@@ -81,6 +81,8 @@ from kabu_app.stores.tick import (
     earliest_dates,
     latest_prices,
     listed_codes,
+    price_jumps,
+    save_jump_checks,
     save_quotes,
 )
 
@@ -502,6 +504,9 @@ def fetch_ticks(
             if splits:
                 saved += _refetch_split_codes(session, client, splits, end)
 
+        if only_jumps:
+            _record_remaining_jumps(session, targets)
+
     logger.info("完了: %d 件保存 / 取得できなかった銘柄 %d 件", saved, failed)
 
 
@@ -620,6 +625,28 @@ def _refetch_split_codes(
         logger.info("%s を %s から取り直した (%d 件)", code, start, count)
 
     return saved
+
+
+def _record_remaining_jumps(session: Session, targets: list[str]) -> int:
+    """取り直しても消えなかった飛びを tick_jump_checks に記録する.
+
+    低位株の 1 円刻みや、売買が成立しない日が続いた後の値付けは本物の値動きなので、
+    取り直しても同じ値が返る。記録しないと毎晩同じ銘柄を取り直し続ける。
+
+    見るのは今回取り直した銘柄だけ。--max-codes で後回しにした銘柄まで記録すると、
+    一度も取り直さないまま判定から外れてしまう。
+    """
+    if not targets:
+        return 0
+
+    remaining = price_jumps(session, codes=targets)
+    if not remaining:
+        return 0
+
+    save_jump_checks(session, remaining)
+    session.commit()
+    logger.info("取り直しても消えなかった飛びを %d 件記録した", len(remaining))
+    return len(remaining)
 
 
 def _overlap_start(watch: tuple[date, Decimal] | None) -> date:

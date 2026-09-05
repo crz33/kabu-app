@@ -16,7 +16,7 @@ from kabu_app.models.tdnet import (
     TdnetStatementFact,
     TdnetSummaryFact,
 )
-from kabu_app.models.tick import Tick
+from kabu_app.models.tick import Tick, TickJumpCheck
 
 __all__ = [
     "MARKET_SEGMENTS",
@@ -34,5 +34,6 @@ __all__ = [
     "TdnetStatementFact",
     "TdnetSummaryFact",
     "Tick",
+    "TickJumpCheck",
     "TimestampMixin",
 ]
