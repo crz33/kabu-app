@@ -63,7 +63,10 @@ def upgrade() -> None:
     op.add_column(
         "tdnet_disclosures",
         sa.Column(
-            "is_consolidated", sa.Boolean(), nullable=True, comment="連結の短信か。解析するまで NULL"
+            "is_consolidated",
+            sa.Boolean(),
+            nullable=True,
+            comment="連結の短信か。解析するまで NULL",
         ),
     )
     op.add_column(
@@ -168,9 +171,7 @@ def upgrade() -> None:
         sa.Column(
             "period_start", sa.Date(), nullable=True, comment="期間の開始日。instant では NULL"
         ),
-        sa.Column(
-            "period_end", sa.Date(), nullable=False, comment="期間の末日、または時点の日付"
-        ),
+        sa.Column("period_end", sa.Date(), nullable=False, comment="期間の末日、または時点の日付"),
         sa.Column(
             "value",
             sa.Numeric(),
@@ -265,9 +266,7 @@ def upgrade() -> None:
         sa.Column(
             "period_start", sa.Date(), nullable=True, comment="期間の開始日。instant では NULL"
         ),
-        sa.Column(
-            "period_end", sa.Date(), nullable=False, comment="期間の末日、または時点の日付"
-        ),
+        sa.Column("period_end", sa.Date(), nullable=False, comment="期間の末日、または時点の日付"),
         sa.Column(
             "value",
             sa.Numeric(),
@@ -301,16 +300,12 @@ def upgrade() -> None:
         "tdnet_statement_facts",
         ["concept", "period_end"],
     )
-    op.create_index(
-        "ix_tdnet_statement_facts_period_end", "tdnet_statement_facts", ["period_end"]
-    )
+    op.create_index("ix_tdnet_statement_facts_period_end", "tdnet_statement_facts", ["period_end"])
 
 
 def downgrade() -> None:
     op.drop_index("ix_tdnet_statement_facts_period_end", table_name="tdnet_statement_facts")
-    op.drop_index(
-        "ix_tdnet_statement_facts_concept_period_end", table_name="tdnet_statement_facts"
-    )
+    op.drop_index("ix_tdnet_statement_facts_concept_period_end", table_name="tdnet_statement_facts")
     op.drop_table("tdnet_statement_facts")
     op.drop_index("ix_tdnet_summary_facts_fact_type", table_name="tdnet_summary_facts")
     op.drop_index("ix_tdnet_summary_facts_concept_period_end", table_name="tdnet_summary_facts")

@@ -51,9 +51,7 @@ def upgrade() -> None:
             comment="期の種類。ytd (年初来累計) / quarter (単独四半期) / year (通期) / "
             "interim (中間) と、時点の quarter_end / year_end / interim_end",
         ),
-        sa.Column(
-            "period_end", sa.Date(), nullable=False, comment="期間の末日、または時点の日付"
-        ),
+        sa.Column("period_end", sa.Date(), nullable=False, comment="期間の末日、または時点の日付"),
         sa.Column(
             "period_start",
             sa.Date(),

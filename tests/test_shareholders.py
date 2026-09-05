@@ -7,13 +7,16 @@ from pathlib import Path
 import pytest
 
 from kabu_app.parsers.shareholders import (
+    Shareholder,
     ShareholdersResult,
     classify,
     parse_shareholders,
 )
 
 
-def _classify(name: str, directors: set[str] | None = None, surnames: set[str] | None = None):
+def _classify(
+    name: str, directors: set[str] | None = None, surnames: set[str] | None = None
+) -> tuple[str, bool]:
     return classify(name, directors or set(), surnames or set())
 
 
@@ -112,9 +115,7 @@ def test_大株主が取れなければ比率はNone() -> None:
     assert result.is_owner_company is None
 
 
-def _holder(rank: int, name: str, ratio: str, kind: str, is_owner: bool):
-    from kabu_app.parsers.shareholders import Shareholder
-
+def _holder(rank: int, name: str, ratio: str, kind: str, is_owner: bool) -> Shareholder:
     return Shareholder(
         rank=rank, name=name, shares=None, ratio=Decimal(ratio), kind=kind, is_owner=is_owner
     )

@@ -132,7 +132,7 @@ def _client(responses: list[int]) -> tuple[httpx.Client, list[int]]:
 
 def test_一時的な500は待って掛け直す(monkeypatch: pytest.MonkeyPatch) -> None:
     """Yahoo は数分にわたって 500 を返すことがある。全銘柄を回す途中だと総崩れになる."""
-    monkeypatch.setattr(yahoo.time, "sleep", lambda _: None)
+    monkeypatch.setattr("kabu_app.collectors.yahoo.time.sleep", lambda _: None)
     client, calls = _client([500, 500, 200])
 
     response = _request(client, "https://example.test/", {"page": "1"})
@@ -142,7 +142,7 @@ def test_一時的な500は待って掛け直す(monkeypatch: pytest.MonkeyPatch
 
 
 def test_回復しなければ例外にする(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(yahoo.time, "sleep", lambda _: None)
+    monkeypatch.setattr("kabu_app.collectors.yahoo.time.sleep", lambda _: None)
     client, calls = _client([500])
 
     with pytest.raises(httpx.HTTPStatusError):
@@ -153,7 +153,7 @@ def test_回復しなければ例外にする(monkeypatch: pytest.MonkeyPatch) -
 
 def test_404は掛け直さない(monkeypatch: pytest.MonkeyPatch) -> None:
     """作りが変わったり銘柄が消えたりした場合。待っても直らない."""
-    monkeypatch.setattr(yahoo.time, "sleep", lambda _: None)
+    monkeypatch.setattr("kabu_app.collectors.yahoo.time.sleep", lambda _: None)
     client, calls = _client([404])
 
     with pytest.raises(httpx.HTTPStatusError):
