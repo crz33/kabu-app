@@ -12,7 +12,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from kabu_app.collectors.edinet import EdinetDocumentMeta
-from kabu_app.models import EdinetFinancial
+from kabu_app.models import EdinetFinancial, Stock
 from kabu_app.normalizers.financials import (
     NET_ASSETS,
     NET_INCOME,
@@ -66,7 +66,25 @@ _INFO = DocumentInfo(
 )
 
 
-def _parsed_document(session: Session) -> None:
+def _stock(code: str, is_listed: bool = True) -> Stock:
+    return Stock(
+        code=code,
+        name=f"銘柄{code}",
+        market_segment="prime",
+        industry33_code="0050",
+        industry33_name="水産・農林業",
+        industry17_code="01",
+        industry17_name="食品",
+        topix_scale_code=None,
+        topix_scale_name=None,
+        base_date=date(2026, 7, 31),
+        is_listed=is_listed,
+    )
+
+
+def _parsed_document(session: Session, with_stock: bool = True) -> None:
+    if with_stock:
+        session.add(_stock(_META.code))
     load_documents(session, [_META])
     mark_downloaded(session, _DOC_ID)
     mark_parsed(session, _DOC_ID, info=_INFO)
@@ -570,3 +588,24 @@ def test_経常利益と経常収益を取り違えない() -> None:
 
     assert _picked(values, NET_SALES)[0][1] == Decimal("9030374")
     assert _picked(values, ORDINARY_INCOME)[0][1] == Decimal("1168141")
+
+
+def test_名寄せの対象はstocksに居る銘柄だけ(session: Session) -> None:
+    """投資の対象はプライム・スタンダード・グロースの内国株に限る.
+
+    ここに来るのはほとんどが上場廃止した会社で、株価が取れないので使い道が無い。
+    """
+    _parsed_document(session, with_stock=False)
+
+    assert documents_to_normalize(session) == []
+
+
+def test_上場廃止した銘柄も名寄せする(session: Session) -> None:
+    """stocks は廃止後も行を残す。廃止直後は直近の決算がまだ意味を持つ."""
+    session.add(_stock(_META.code, is_listed=False))
+    load_documents(session, [_META])
+    mark_downloaded(session, _DOC_ID)
+    mark_parsed(session, _DOC_ID, info=_INFO)
+    session.flush()
+
+    assert [d.doc_id for d in documents_to_normalize(session)] == [_DOC_ID]

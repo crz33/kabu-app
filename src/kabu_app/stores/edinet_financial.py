@@ -18,6 +18,7 @@ from kabu_app.models import (
     EdinetFact,
     EdinetFinancial,
     EdinetLabel,
+    Stock,
 )
 from kabu_app.normalizers.financials import FinancialValue, SourceFact
 
@@ -46,10 +47,19 @@ def documents_to_normalize(
 
     会計年度末が入っていない書類は外す。どの期の書類か決まらないと、期ごとの最新を
     選べないため。解析すれば埋まるので、次の ``kabu parse edinet`` が拾う。
+
+    stocks に無い銘柄も外す。投資の対象はプライム・スタンダード・グロースの内国株に限る
+    ので、それ以外の財務項目を持っても引く場面が無い。ここに来るのはほとんどが上場廃止した
+    会社で、株価が取れないためバックテストにも使えない。実測では 271 銘柄のうち 192 銘柄に
+    ticks が 1 行も無かった。
+
+    絞るのは名寄せの入口であって、取得ではない。edinet_documents と edinet_facts は全部
+    残す。方針を変えたときに --renormalize で作り直せる。
     """
     normalized = select(EdinetFinancial.doc_id).distinct().scalar_subquery()
     statement: Select[tuple[EdinetDocument]] = (
         select(EdinetDocument)
+        .join(Stock, Stock.code == EdinetDocument.code)
         .where(
             EdinetDocument.parsed_at.is_not(None),
             EdinetDocument.fiscal_year_end.is_not(None),

@@ -14,6 +14,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from kabu_app.models import (
+    Stock,
     TdnetDisclosure,
     TdnetFinancial,
     TdnetStatementFact,
@@ -200,10 +201,22 @@ def disclosures_to_normalize(
     ``renormalize`` を立てると名寄せ済みも返す。項目の定義を直して全件を作り直すとき用。
 
     XBRL の無い短信は外す。``mark_no_xbrl`` が理由を残しているので、それで見分ける。
+
+    stocks に無い銘柄も外す。TDnet の取得は表題に「決算短信」が入るものを全部拾うので、
+    REIT や地方市場の単独上場銘柄が混ざる。stocks はプライム・スタンダード・グロースの
+    内国株だけを持つため、結合すればその 3 区分に絞れる。
+
+    絞るのは名寄せの入口であって、取得ではない。TDnet の開示は 31 日で消えるので、取得時に
+    落とすと二度と取れない。新規上場した銘柄が JPX 銘柄一覧に載るのは月次更新のあとになり、
+    それまでの短信を取り逃す。生データは全部残して、出口で絞る。
+
+    上場廃止した銘柄は stocks に is_listed = false で残るので、ここでは落ちない。過去の
+    決算を評価するときに生存者バイアスが入らないようにする。
     """
     normalized = select(TdnetFinancial.doc_id).distinct().scalar_subquery()
     statement: Select[tuple[TdnetDisclosure]] = (
         select(TdnetDisclosure)
+        .join(Stock, Stock.code == TdnetDisclosure.code)
         .where(
             TdnetDisclosure.parsed_at.is_not(None),
             TdnetDisclosure.parse_error.is_(None),

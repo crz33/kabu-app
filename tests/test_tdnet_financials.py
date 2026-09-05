@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from kabu_app.collectors.edinet import EdinetDocumentMeta
 from kabu_app.collectors.tdnet import TdnetDisclosureMeta
+from kabu_app.models import Stock
 from kabu_app.normalizers.financials import (
     NET_ASSETS,
     NET_SALES,
@@ -36,7 +37,11 @@ from kabu_app.stores.edinet import load_documents
 from kabu_app.stores.edinet_fact import mark_parsed as mark_edinet_parsed
 from kabu_app.stores.edinet_financial import save_financials
 from kabu_app.stores.tdnet import load_disclosures
-from kabu_app.stores.tdnet_fact import save_tdnet_financials
+from kabu_app.stores.tdnet_fact import (
+    disclosures_to_normalize,
+    mark_parsed,
+    save_tdnet_financials,
+)
 
 
 def _fact(
@@ -388,3 +393,61 @@ def _tdnet_row(session: Session, kind: str, period_end: date, value: int) -> Non
             )
         ],
     )
+
+
+def _stock(code: str, is_listed: bool = True) -> Stock:
+    return Stock(
+        code=code,
+        name=f"銘柄{code}",
+        market_segment="prime",
+        industry33_code="0050",
+        industry33_name="水産・農林業",
+        industry17_code="01",
+        industry17_name="食品",
+        topix_scale_code=None,
+        topix_scale_name=None,
+        base_date=date(2026, 7, 31),
+        is_listed=is_listed,
+    )
+
+
+def _parsed_disclosure(session: Session, code: str, doc_id: str) -> None:
+    """名寄せ待ちの短信を 1 件入れる. 解析は済んで名寄せ結果がまだ無い状態."""
+    load_disclosures(
+        session,
+        [
+            TdnetDisclosureMeta(
+                doc_id=doc_id,
+                disclosed_date=date(2026, 8, 14),
+                disclosed_time=time(15, 0),
+                sec_code=f"{code}0",
+                code=code,
+                company_name=f"会社{code}",
+                title="決算短信",
+                markets="東",
+                is_amendment=False,
+                xbrl_file=f"{doc_id}.zip",
+            )
+        ],
+    )
+    mark_parsed(session, doc_id)
+    session.flush()
+
+
+def test_名寄せの対象はstocksに居る銘柄だけ(session: Session) -> None:
+    """TDnet は表題で拾うので、REIT や地方市場の単独上場銘柄が混ざる."""
+    _parsed_disclosure(session, code="7203", doc_id="TD7203")
+    _parsed_disclosure(session, code="8951", doc_id="TD8951")
+    session.add(_stock("7203"))
+    session.flush()
+
+    assert [d.doc_id for d in disclosures_to_normalize(session)] == ["TD7203"]
+
+
+def test_上場廃止した銘柄も名寄せする(session: Session) -> None:
+    """stocks は廃止後も行を残す。過去の決算に生存者バイアスを入れないため."""
+    _parsed_disclosure(session, code="7203", doc_id="TD7203")
+    session.add(_stock("7203", is_listed=False))
+    session.flush()
+
+    assert [d.doc_id for d in disclosures_to_normalize(session)] == ["TD7203"]
