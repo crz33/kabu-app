@@ -1,4 +1,4 @@
-"""JPX の東証上場銘柄一覧 (data_j.xls) を取得して正規化する.
+"""JPX の東証上場銘柄一覧 (data_j.xlsx) を取得して正規化する.
 
 このモジュールは DB を知らない。取得と正規化だけを行い、結果を dataclass で返す。
 """
@@ -16,8 +16,15 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 JPX_STOCK_LIST_URL = (
-    "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
+    "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xlsx"
 )
+"""東証上場銘柄一覧の置き場.
+
+2026 年 9 月に ``.xls`` から ``.xlsx`` へ変わり、旧 URL は 404 を返すようになった。
+``tvdivq0000001vg2-att`` の部分は変わっていない。JPX はこのパスも時々振り直すので、
+404 になったら「その他統計資料」のページ
+(https://www.jpx.co.jp/markets/statistics-equities/misc/01.html) を開いて確認する。
+"""
 
 MARKET_SEGMENT_BY_JPX = {
     "プライム（内国株式）": "prime",
@@ -106,13 +113,13 @@ def parse_stock_list(path: Path) -> JpxStockList:
 def fetch_stock_list(data_dir: Path) -> tuple[Path, JpxStockList]:
     """ダウンロードして基準日ごとのファイル名で保存し、正規化した内容を返す.
 
-    保存先は ``<data_dir>/jpx/stock_list/data_j_YYYYMMDD.xls``。
+    保存先は ``<data_dir>/jpx/stock_list/data_j_YYYYMMDD.xlsx``。
     基準日はダウンロードするまで分からないため、いったん一時ファイルに落としてから移す。
     """
     save_dir = data_dir / "jpx" / "stock_list"
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    handle = tempfile.NamedTemporaryFile(dir=save_dir, suffix=".xls.part", delete=False)
+    handle = tempfile.NamedTemporaryFile(dir=save_dir, suffix=".xlsx.part", delete=False)
     handle.close()
     tmp_path = Path(handle.name)
 
@@ -123,7 +130,7 @@ def fetch_stock_list(data_dir: Path) -> tuple[Path, JpxStockList]:
         tmp_path.unlink(missing_ok=True)
         raise
 
-    dest = save_dir / f"data_j_{data.base_date:%Y%m%d}.xls"
+    dest = save_dir / f"data_j_{data.base_date:%Y%m%d}.xlsx"
     tmp_path.replace(dest)
     # 一時ファイルは 0600 で作られる。生データなので通常のファイル権限に戻す。
     dest.chmod(0o644)
