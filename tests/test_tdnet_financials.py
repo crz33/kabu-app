@@ -15,8 +15,10 @@ from kabu_app.collectors.tdnet import TdnetDisclosureMeta
 from kabu_app.models import Stock
 from kabu_app.normalizers.financials import (
     NET_ASSETS,
+    NET_INCOME,
     NET_SALES,
     OPERATING_INCOME,
+    ORDINARY_INCOME,
     TOTAL_ASSETS,
 )
 from kabu_app.normalizers.financials import FinancialValue as EdinetFinancialValue
@@ -29,17 +31,23 @@ from kabu_app.normalizers.tdnet_financials import (
     YTD,
     FinancialValue,
     SourceFact,
+    SummarySourceFact,
     normalize,
+    normalize_summary,
     period_kind_of,
 )
 from kabu_app.parsers.edinet_xbrl import DocumentInfo
+from kabu_app.parsers.tdnet_xbrl import StatementFact
 from kabu_app.stores.edinet import load_documents
 from kabu_app.stores.edinet_fact import mark_parsed as mark_edinet_parsed
 from kabu_app.stores.edinet_financial import save_financials
 from kabu_app.stores.tdnet import load_disclosures
 from kabu_app.stores.tdnet_fact import (
     disclosures_to_normalize,
+    load_statement_source_facts,
+    load_summary_source_facts,
     mark_parsed,
+    save_statement_facts,
     save_tdnet_financials,
 )
 
@@ -451,3 +459,178 @@ def test_上場廃止した銘柄も名寄せする(session: Session) -> None:
     session.flush()
 
     assert [d.doc_id for d in disclosures_to_normalize(session)] == ["TD7203"]
+
+
+def _summary(
+    concept: str,
+    value: str,
+    period_kind: str = "AccumulatedQ1",
+    period_type: str = "duration",
+    period_end: date = date(2026, 6, 30),
+    period_start: date | None = date(2026, 4, 1),
+) -> SummarySourceFact:
+    return SummarySourceFact(
+        concept=concept,
+        period_kind=period_kind,
+        period_type=period_type,
+        period_start=None if period_type == "instant" else period_start,
+        period_end=period_end,
+        value=Decimal(value),
+        unit="JPY",
+    )
+
+
+def test_米国基準の表紙から6項目を寄せる() -> None:
+    """米国基準の会社は決算短信の添付 XBRL を出さない。表紙にしか数値が無い."""
+    facts = [
+        _summary("tse-ed-t_NetSalesUS", "826493000000"),
+        _summary("tse-ed-t_OperatingIncomeUS", "51184000000"),
+        _summary("tse-ed-t_IncomeBeforeIncomeTaxesUS", "52100000000"),
+        _summary("tse-ed-t_NetIncomeUS", "37424000000"),
+        _summary("tse-ed-t_TotalAssetsUS", "6167301000000", period_type="instant"),
+        _summary("tse-ed-t_NetAssetsUS", "3903549000000", period_type="instant"),
+    ]
+
+    values = normalize_summary(facts)
+
+    assert {(v.item, v.period_kind) for v in values} == {
+        (NET_SALES, YTD),
+        (OPERATING_INCOME, YTD),
+        (ORDINARY_INCOME, YTD),
+        (NET_INCOME, YTD),
+        (TOTAL_ASSETS, QUARTER_END),
+        (NET_ASSETS, QUARTER_END),
+    }
+    assert all(v.source_section == "SM" for v in values)
+
+
+def test_通期の表紙は年度の期になる() -> None:
+    facts = [
+        _summary("tse-ed-t_NetSales", "1000", period_kind="Year", period_end=date(2026, 3, 31)),
+        _summary(
+            "tse-ed-t_TotalAssets",
+            "5000",
+            period_kind="Year",
+            period_type="instant",
+            period_end=date(2026, 3, 31),
+        ),
+    ]
+
+    values = normalize_summary(facts)
+
+    assert {(v.item, v.period_kind) for v in values} == {
+        (NET_SALES, YEAR),
+        (TOTAL_ASSETS, YEAR_END),
+    }
+
+
+def test_中間期も年初来累計として扱う() -> None:
+    """表紙の期の呼び方に中間を表すものが無く、AccumulatedQ2 としか書かれていない."""
+    facts = [_summary("tse-ed-t_NetSales", "600", period_kind="AccumulatedQ2")]
+
+    values = normalize_summary(facts)
+
+    assert [(v.item, v.period_kind) for v in values] == [(NET_SALES, YTD)]
+    assert INTERIM not in {v.period_kind for v in values}
+
+
+def test_表紙はIFRSを日本基準より先に採る() -> None:
+    """会計基準を切り替えた期に両方の要素が入ることがある."""
+    facts = [
+        _summary("tse-ed-t_NetSales", "100"),
+        _summary("tse-ed-t_NetSalesIFRS", "200"),
+    ]
+
+    values = normalize_summary(facts)
+
+    assert [(v.value, v.source_concept) for v in values] == [
+        (Decimal("200"), "tse-ed-t_NetSalesIFRS")
+    ]
+
+
+def test_自己資本は純資産に寄せない() -> None:
+    """OwnersEquity と ShareholdersEquityUS は自己資本で、純資産とは別物."""
+    facts = [
+        _summary("tse-ed-t_OwnersEquity", "800", period_type="instant"),
+        _summary("tse-ed-t_ShareholdersEquityUS", "900", period_type="instant"),
+    ]
+
+    assert normalize_summary(facts) == []
+
+
+def test_表紙の入力から会社予想を外す(session: Session) -> None:
+    """表紙には当期の予想が実績と同じ要素名で載る。混ぜると予想を実績として取り込む."""
+    _parsed_disclosure(session, code="4901", doc_id="TD4901")
+    session.execute(
+        text(
+            "INSERT INTO tdnet_summary_facts"
+            " (doc_id, concept, context_ref, scope, period_kind, is_consolidated,"
+            "  fact_type, period_type, period_start, period_end, value, unit)"
+            " VALUES"
+            " ('TD4901', 'tse-ed-t_NetSalesUS', 'c1', 'Current', 'AccumulatedQ1', true,"
+            "  'Result', 'duration', '2026-04-01', '2026-06-30', 826493000000, 'JPY'),"
+            " ('TD4901', 'tse-ed-t_NetSalesUS', 'c2', 'Current', 'Year', true,"
+            "  'Forecast', 'duration', '2026-04-01', '2027-03-31', 3560000000000, 'JPY')"
+        )
+    )
+    session.flush()
+
+    facts = load_summary_source_facts(session, "TD4901", is_consolidated=True)
+
+    assert [f.value for f in facts] == [Decimal("826493000000")]
+
+
+def _attachment_fact(session: Session, doc_id: str, is_consolidated: bool) -> None:
+    """添付のファクトを 1 行入れる. 連結・単体の別だけを見たいので中身は最小にする."""
+    save_statement_facts(
+        session,
+        doc_id,
+        [
+            StatementFact(
+                section="PL",
+                term="q",
+                is_consolidated=is_consolidated,
+                concept="jppfs_cor_NetSales",
+                context_ref="CurrentYTDDuration",
+                member=None,
+                ordinal=1,
+                period_type="duration",
+                period_start=date(2026, 4, 1),
+                period_end=date(2026, 6, 30),
+                value=Decimal("100"),
+                unit="JPY",
+                decimals="-6",
+            )
+        ],
+    )
+    session.flush()
+
+
+def test_表紙が無い単体決算の書類も添付から拾える(session: Session) -> None:
+    """表紙を持たない ZIP があり、素性が読めないまま解析済みになる.
+
+    連結と決め打つと、単体の行しか無い添付から 1 項目も取れない。
+    """
+    _parsed_disclosure(session, code="2130", doc_id="TD2130")
+    _attachment_fact(session, "TD2130", is_consolidated=False)
+
+    facts = load_statement_source_facts(session, "TD2130", is_consolidated=None)
+
+    assert [f.concept for f in facts] == ["jppfs_cor_NetSales"]
+
+
+def test_表紙が無い連結の書類はこれまでどおり連結を採る(session: Session) -> None:
+    _parsed_disclosure(session, code="7203", doc_id="TD7203")
+    _attachment_fact(session, "TD7203", is_consolidated=True)
+
+    facts = load_statement_source_facts(session, "TD7203", is_consolidated=None)
+
+    assert [f.concept for f in facts] == ["jppfs_cor_NetSales"]
+
+
+def test_素性が分かっている書類は添付を見ない(session: Session) -> None:
+    """連結と指定された書類に単体の行しか無ければ、これまでどおり空になる."""
+    _parsed_disclosure(session, code="7203", doc_id="TD7203")
+    _attachment_fact(session, "TD7203", is_consolidated=False)
+
+    assert load_statement_source_facts(session, "TD7203", is_consolidated=True) == []

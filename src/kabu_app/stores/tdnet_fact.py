@@ -22,10 +22,16 @@ from kabu_app.models import (
 )
 from kabu_app.normalizers.tdnet_financials import FinancialValue as TdnetFinancialValue
 from kabu_app.normalizers.tdnet_financials import SourceFact as TdnetSourceFact
+from kabu_app.normalizers.tdnet_financials import (
+    SummarySourceFact as TdnetSummarySourceFact,
+)
 from kabu_app.parsers.tdnet_xbrl import DisclosureInfo, StatementFact, SummaryFact
 from kabu_app.stores.edinet_financial import NON_CONSOLIDATED_MEMBER
 
 logger = logging.getLogger(__name__)
+
+_SUMMARY_RESULT = "Result"
+"""表紙の fact_type のうち実績を表す値. Forecast は会社予想なので名寄せに入れない."""
 
 _CHUNK_SIZE = 1000
 
@@ -244,8 +250,12 @@ def load_statement_source_facts(
     提出回数の DEI だった。有報とまったく同じ構造で、連結企業と同じ条件で引くとこの 763
     書類から 1 項目も取れない。
 
-    連結の指定が無い書類は連結として扱う。実測では表紙の入らない書類だけがそうなり、
-    400 件で 2 件だった。
+    連結の指定が無い書類は、添付に入っているほうを採る。表紙 (``XBRLData/Summary/``) を
+    持たない ZIP があり、書類の素性を読む先が無いまま解析済みになる。実測 22 件がこれで、
+    14 件は単体、8 件は連結だった。連結と単体が混ざる書類は無い。
+
+    ここを「指定が無ければ連結」と決め打つと、単体決算の 14 件から 1 項目も取れない。
+    添付は単体の行しか持たず、連結で絞ると 0 件になるため。
 
     セグメント別の値は落とす。損益計算書と貸借対照表だけを見る。包括利益・株主資本等変動・
     セグメントに 6 項目は入らない。
@@ -258,6 +268,9 @@ def load_statement_source_facts(
     ``PL`` と両方を持つ書類も 9 件ある。同じ期の同じ項目は 1 つに絞られるのでぶつからない。
     ``tdnet_statement_facts`` では別の section のまま残し、ここでだけ寄せる。
     """
+    if is_consolidated is None:
+        is_consolidated = _consolidated_flag_in_attachment(session, doc_id)
+
     member_filter = (
         TdnetStatementFact.member.is_(None)
         if is_consolidated is not False
@@ -327,3 +340,69 @@ def save_tdnet_financials(
 
     session.flush()
     return len(rows)
+
+
+def load_summary_source_facts(
+    session: Session, doc_id: str, is_consolidated: bool | None
+) -> list[TdnetSummarySourceFact]:
+    """表紙の名寄せの入力を 1 書類分そろえる.
+
+    添付が空の書類でだけ使う。米国基準の会社は決算短信の添付 XBRL を出さず、数値データの
+    訂正短信も表紙だけを出し直す。どちらも表紙には 6 項目が揃っている。
+
+    会社予想を外す。表紙には当期の予想が実績と同じ要素名で載り、``fact_type`` だけが
+    ``Forecast`` になる。混ぜると予想を実績として取り込む。
+
+    前期は残す。``scope`` が ``Prior`` の行は前年同期の実績で、``period_end`` が違うので
+    当期とぶつからない。
+
+    連結と単体の選び方は添付と同じ。連結企業は連結の行を採り、単体決算の会社は単体を採る。
+    連結の指定が無い書類は連結として扱う。
+    """
+    rows = session.execute(
+        select(
+            TdnetSummaryFact.concept,
+            TdnetSummaryFact.period_kind,
+            TdnetSummaryFact.period_type,
+            TdnetSummaryFact.period_start,
+            TdnetSummaryFact.period_end,
+            TdnetSummaryFact.value,
+            TdnetSummaryFact.unit,
+        ).where(
+            TdnetSummaryFact.doc_id == doc_id,
+            TdnetSummaryFact.fact_type == _SUMMARY_RESULT,
+            TdnetSummaryFact.is_consolidated.is_(is_consolidated is not False),
+        )
+    ).all()
+
+    return [
+        TdnetSummarySourceFact(
+            concept=row.concept,
+            period_kind=row.period_kind,
+            period_type=row.period_type,
+            period_start=row.period_start,
+            period_end=row.period_end,
+            value=row.value,
+            unit=row.unit,
+        )
+        for row in rows
+    ]
+
+
+def _consolidated_flag_in_attachment(session: Session, doc_id: str) -> bool:
+    """添付に入っている連結・単体の別を返す. 表紙を持たない書類の素性を決めるのに使う.
+
+    連結の行が 1 つでもあれば連結として扱う。実測では連結と単体が混ざる書類は無く、
+    どちらか一方しか入っていなかった。行が 1 つも無ければ連結を返す。どちらで引いても
+    0 件になるので、既定を変えても結果は変わらない。
+    """
+    return bool(
+        session.execute(
+            select(TdnetStatementFact.doc_id)
+            .where(
+                TdnetStatementFact.doc_id == doc_id,
+                TdnetStatementFact.is_consolidated.is_(True),
+            )
+            .limit(1)
+        ).first()
+    )

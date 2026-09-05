@@ -34,6 +34,7 @@ from kabu_app.db import create_session_factory, session_scope
 from kabu_app.models import EdinetDocument, TdnetDisclosure
 from kabu_app.normalizers.financials import ITEMS, normalize
 from kabu_app.normalizers.tdnet_financials import normalize as normalize_tdnet
+from kabu_app.normalizers.tdnet_financials import normalize_summary as normalize_tdnet_summary
 from kabu_app.parsers import EdinetXbrlError, parse_document, parse_shareholders
 from kabu_app.parsers.taxonomy import parse_taxonomy_labels, taxonomy_path
 from kabu_app.parsers.tdnet_xbrl import TdnetXbrlError, complete_info, parse_disclosure
@@ -69,6 +70,7 @@ from kabu_app.stores.tdnet_fact import (
     disclosures_by_id,
     disclosures_to_normalize,
     load_statement_source_facts,
+    load_summary_source_facts,
     mark_no_xbrl,
     save_statement_facts,
     save_summary_facts,
@@ -1044,10 +1046,22 @@ def _normalize_tdnet_documents(
     """
     total_rows = 0
     empty = 0
+    from_summary = 0
 
     for index, disclosure in enumerate(disclosures, start=1):
         facts = load_statement_source_facts(session, disclosure.doc_id, disclosure.is_consolidated)
         values = normalize_tdnet(facts)
+        if not values:
+            # 添付が空なら表紙で代える。米国基準の会社は添付 XBRL を出さず、数値データの
+            # 訂正短信も表紙だけを出し直す。表紙の値は百万円に丸めてあるので、添付が
+            # 取れているうちは使わない。
+            summary = load_summary_source_facts(
+                session, disclosure.doc_id, disclosure.is_consolidated
+            )
+            values = normalize_tdnet_summary(summary)
+            if values:
+                from_summary += 1
+
         total_rows += save_tdnet_financials(session, disclosure.doc_id, values)
         if not values:
             empty += 1
@@ -1056,5 +1070,8 @@ def _normalize_tdnet_documents(
 
         if index % 500 == 0:
             logger.info("%d / %d 件 (%d 行)", index, len(disclosures), total_rows)
+
+    if from_summary:
+        logger.info("添付が空のため表紙から取った開示が %d 件", from_summary)
 
     return total_rows, empty

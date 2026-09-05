@@ -282,6 +282,12 @@ class TdnetFinancial(Base, TimestampMixin):
 
     実績はこちらを使うこと。表紙 (``tdnet_summary_facts``) にも同じ数値が載るが、
     百万円に丸めてある。表紙を読むのは会社予想のためになる。
+
+    添付が空の書類だけは表紙から寄せる。``source_section`` が ``SM`` の行がそれで、値は
+    百万円に丸まっている。米国基準の会社は決算短信の添付 XBRL を出さず、数値データの訂正
+    短信も表紙だけを出し直すため。表紙は累計しか載せないので、単独四半期 (``quarter``) の
+    行は入らない。中間期も ``interim`` ではなく ``ytd`` になる。表紙の期の呼び方に中間を
+    表すものが無く、``AccumulatedQ2`` としか書かれていないため。
     """
 
     __tablename__ = "tdnet_financials"

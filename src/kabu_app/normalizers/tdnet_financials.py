@@ -22,7 +22,16 @@ from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 
-from kabu_app.normalizers.financials import ITEM_SPECS, ItemSpec
+from kabu_app.normalizers.financials import (
+    ITEM_SPECS,
+    NET_ASSETS,
+    NET_INCOME,
+    NET_SALES,
+    OPERATING_INCOME,
+    ORDINARY_INCOME,
+    TOTAL_ASSETS,
+    ItemSpec,
+)
 
 YTD = "ytd"
 QUARTER = "quarter"
@@ -146,6 +155,187 @@ def _normalize_item(spec: ItemSpec, facts: Sequence[SourceFact]) -> list[Financi
             value=fact.value,
             unit=fact.unit,
             source_section=fact.section,
+            source_concept=fact.concept,
+        )
+        for (kind, period_end), (_, fact) in sorted(best.items())
+    ]
+
+
+_SUMMARY_PERIOD_KIND: dict[tuple[str, str], str] = {
+    ("Year", "Duration"): YEAR,
+    ("Year", "Instant"): YEAR_END,
+    ("AccumulatedQ1", "Duration"): YTD,
+    ("AccumulatedQ2", "Duration"): YTD,
+    ("AccumulatedQ3", "Duration"): YTD,
+    ("AccumulatedQ1", "Instant"): QUARTER_END,
+    ("AccumulatedQ2", "Instant"): QUARTER_END,
+    ("AccumulatedQ3", "Instant"): QUARTER_END,
+}
+"""表紙の期の呼び方を、添付と同じ period_kind に移す.
+
+表紙は四半期の連番でしか期を表さない。添付の context にある ``Interim`` にあたるものが
+無いため、中間決算短信も ``AccumulatedQ2`` で来る。中間期を ``interim`` と区別できないので
+``ytd`` に寄せる。6 か月累計は年初来累計そのものなので、値の意味は変わらない。様式の
+区別が付かなくなるだけになる。
+
+単独四半期 (``quarter``) は表紙に無い。表紙が載せるのは累計だけになる。
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class SummarySourceFact:
+    """表紙の名寄せの入力. ``tdnet_summary_facts`` の 1 行から要る列だけを取ったもの."""
+
+    concept: str
+    period_kind: str
+    period_type: str
+    period_start: date | None
+    period_end: date
+    value: Decimal
+    unit: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class SummarySpec:
+    """表紙から 1 項目を拾う定義.
+
+    ``concepts`` は優先順の高い順。IFRS・米国基準・日本基準の順に並べる。会計基準を
+    切り替えた期に両方の要素が入ることがあり、新しい基準を採る。
+    """
+
+    item: str
+    period_type: str
+    concepts: tuple[str, ...]
+
+
+SUMMARY_SPECS: tuple[SummarySpec, ...] = (
+    SummarySpec(
+        item=NET_SALES,
+        period_type="duration",
+        concepts=(
+            "tse-ed-t_NetSalesIFRS",
+            "tse-ed-t_RevenueIFRS",
+            "tse-ed-t_NetSalesUS",
+            # 野村・オリックスの収益。金融費用控除後を先に置く
+            "tse-ed-t_TotalRevenuesAfterDeductingFinancialExpenseUS",
+            "tse-ed-t_TotalRevenuesUS",
+            "tse-ed-t_OperatingRevenuesUS",
+            "tse-ed-t_NetSales",
+            "tse-ed-t_OperatingRevenues",
+            # 銀行の経常収益と証券の営業収益。要素名の Income に釣られないこと
+            "tse-ed-t_OrdinaryRevenuesBK",
+            "tse-ed-t_NetOperatingRevenuesSE",
+            "tse-ed-t_OperatingRevenuesSE",
+        ),
+    ),
+    SummarySpec(
+        item=OPERATING_INCOME,
+        period_type="duration",
+        concepts=(
+            "tse-ed-t_OperatingIncomeIFRS",
+            "tse-ed-t_OperatingIncomeUS",
+            "tse-ed-t_OperatingIncome",
+        ),
+    ),
+    SummarySpec(
+        item=ORDINARY_INCOME,
+        period_type="duration",
+        # IFRS と米国基準に経常利益の概念は無い。税引前利益で代える
+        concepts=(
+            "tse-ed-t_ProfitBeforeTaxIFRS",
+            "tse-ed-t_IncomeBeforeIncomeTaxesUS",
+            "tse-ed-t_IncomeFromContinuingOperationsBeforeIncomeTaxesUS",
+            "tse-ed-t_OrdinaryIncome",
+        ),
+    ),
+    SummarySpec(
+        item=NET_INCOME,
+        period_type="duration",
+        # 親会社帰属を優先する。単体決算の会社だけ全体の当期純利益に落ちる
+        concepts=(
+            "tse-ed-t_ProfitAttributableToOwnersOfParentIFRS",
+            "tse-ed-t_ProfitIFRS",
+            "tse-ed-t_NetIncomeUS",
+            "tse-ed-t_ProfitAttributableToOwnersOfParent",
+            "tse-ed-t_NetIncome",
+        ),
+    ),
+    SummarySpec(
+        item=TOTAL_ASSETS,
+        period_type="instant",
+        concepts=(
+            "tse-ed-t_TotalAssetsIFRS",
+            "tse-ed-t_TotalAssetsUS",
+            "tse-ed-t_TotalAssets",
+        ),
+    ),
+    SummarySpec(
+        item=NET_ASSETS,
+        period_type="instant",
+        # 自己資本 (OwnersEquity / ShareholdersEquityUS /
+        # EquityAttributableToOwnersOfParentIFRS) は純資産ではないので入れない
+        concepts=(
+            "tse-ed-t_TotalEquityIFRS",
+            "tse-ed-t_NetAssetsUS",
+            "tse-ed-t_NetAssets",
+        ),
+    ),
+)
+"""表紙から 6 項目を拾う定義.
+
+添付が空の書類でだけ使う。米国基準の会社は決算短信の添付 XBRL を出しておらず、実測では
+41 書類すべてで財務数値が 1 つも入っていなかった。数値データの訂正短信も表紙だけを出す。
+
+表紙の値は百万円に丸めてある。添付があるならそちらが正確なので、必ず添付を先に見ること。
+"""
+
+
+def normalize_summary(facts: Iterable[SummarySourceFact]) -> list[FinancialValue]:
+    """表紙のファクトを財務項目に寄せる. 項目の定義順・期の昇順で返す.
+
+    会社予想 (``fact_type`` が Forecast) は呼び出し側で外すこと。表紙には当期の予想が
+    同じ要素名で載るので、混ぜると実績と区別が付かなくなる。
+
+    連結と単体も呼び出し側で絞ること。添付と同じ扱いになる。
+    """
+    rows = list(facts)
+    results: list[FinancialValue] = []
+    for spec in SUMMARY_SPECS:
+        results.extend(_normalize_summary_item(spec, rows))
+    return results
+
+
+def _normalize_summary_item(
+    spec: SummarySpec, facts: Sequence[SummarySourceFact]
+) -> list[FinancialValue]:
+    """表紙から 1 項目を (期の種類, 期末) ごとに 1 つへ絞る."""
+    priority = {concept: index for index, concept in enumerate(spec.concepts)}
+    best: dict[tuple[str, date], tuple[int, SummarySourceFact]] = {}
+
+    for fact in facts:
+        if fact.period_type != spec.period_type:
+            continue
+        rank = priority.get(fact.concept)
+        if rank is None:
+            continue
+        kind = _SUMMARY_PERIOD_KIND.get((fact.period_kind, fact.period_type.capitalize()))
+        if kind is None:
+            continue
+
+        key = (kind, fact.period_end)
+        current = best.get(key)
+        if current is None or rank < current[0]:
+            best[key] = (rank, fact)
+
+    return [
+        FinancialValue(
+            item=spec.item,
+            period_kind=kind,
+            period_start=fact.period_start,
+            period_end=period_end,
+            value=fact.value,
+            unit=fact.unit,
+            source_section="SM",
             source_concept=fact.concept,
         )
         for (kind, period_end), (_, fact) in sorted(best.items())
