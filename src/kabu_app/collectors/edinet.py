@@ -173,11 +173,20 @@ def _raise_for_api_error(payload: dict[str, Any], target_date: date) -> None:
 
 
 def _build_meta(record: dict[str, Any]) -> EdinetDocumentMeta | None:
-    """API のレコードを正規化する. 対象外なら None を返す."""
+    """API のレコードを正規化する. 対象外なら None を返す.
+
+    証券コードが無い提出者を落とす。2 種類が混ざる。``ordinanceCode`` が 010 (企業内容等の
+    開示) で ``secCode`` が無いのは非上場の会社で、ゴルフ場の運営会社などが並ぶ。030 (特定
+    有価証券の開示) は投資法人と資産運用会社で、**上場している REIT でも secCode が付かない**。
+    実測 3 日分で 010 が 37 件、030 が 70 件だった。
+
+    どちらも stocks の対象外なのでまとめて落としてよい。REIT が edinet_documents に 1 件も
+    入っていないのはこのためで、狙って除いたわけではない。REIT を扱うと決めたら、この行では
+    なく ``secCode`` を使わない引き方を考えることになる。
+    """
     if record.get("docTypeCode") not in TARGET_DOC_TYPES:
         return None
 
-    # 証券コードが無いのは非上場の提出者。投資判断の対象にならない。
     sec_code = _text(record.get("secCode"))
     if sec_code is None:
         return None
