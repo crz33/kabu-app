@@ -9,8 +9,10 @@
 # 株価の差分取得はここに入れない。週次の weekly_ticks.sh が担当する。日足は 1 日 1 本しか
 # 増えないのに、毎晩やると Yahoo に週 26000 リクエスト投げることになるため。
 #
-# 入れてあるのは株式分割で調整が狂った銘柄の遡り。1 晩 50 銘柄に絞る。遡りは 1 銘柄で
-# 40 ページ近く叩くので、まとめて流すと締められる。対象が尽きれば 0 件で即座に終わる。
+# 入れてあるのは調整後終値の飛び直し。分割の遡り自体は weekly_ticks.sh が差分の重なりで
+# 検出してやる。こちらは閾値で洗い出す保険で、重なり検出が取りこぼしたぶんを拾う。
+# 1 晩 50 銘柄に絞る。取り直しは 1 銘柄で 40 ページ近く叩くので、まとめて流すと締められる。
+# 対象が尽きれば 0 件で即座に終わる。
 #
 # 取り直しても消えない飛びは tick_jump_checks に記録して、次の判定から外す。低位株の
 # 1 円刻みや、売買が成立しない日が続いた後の値付けは本物の値動きにあたる。記録しないと
@@ -66,7 +68,7 @@ run "財務項目の名寄せ" uv run kabu normalize financials
 run "TDnet"         uv run kabu fetch tdnet
 run "TDnet 解析"     uv run kabu parse tdnet
 run "短信の名寄せ"   uv run kabu normalize tdnet-financials
-run "株価の遡り"     uv run kabu fetch ticks --only-jumps --from 2024-01-04 --max-codes 50
+run "株価の飛び直し" uv run kabu fetch ticks --only-jumps --from 2024-01-04 --max-codes 50
 
 if [ ${#failed[@]} -gt 0 ]; then
     echo "失敗した処理: ${failed[*]}" >&2
