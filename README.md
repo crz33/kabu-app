@@ -323,7 +323,7 @@ cron から 2 本。スクリプトはリポジトリ直下に移動してから
 
 ```cron
 0 1 * * *  $HOME/kabu-app/scripts/nightly.sh      2>&1 | /usr/bin/logger -t kabu
-0 5 * * 6  $HOME/kabu-app/scripts/weekly_ticks.sh 2>&1 | /usr/bin/logger -t kabu-ticks
+0 3 * * 6  $HOME/kabu-app/scripts/weekly_ticks.sh 2>&1 | /usr/bin/logger -t kabu-ticks
 ```
 
 ```bash
@@ -344,7 +344,10 @@ journalctl -t kabu-ticks -n 50
 | 7 | 短信の名寄せ | 数秒 |
 | 8 | 株価の飛び直し (50 銘柄) | 65 分 |
 
-`weekly_ticks.sh` は株価の取得だけ。上場中の全銘柄を 2 秒間隔で叩くので 2 時間かかる。
+`weekly_ticks.sh` は株価の取得だけ。上場中の全銘柄を 2 秒間隔で叩くので 2 時間 20 分かかる。
+03:00 なのは `apt-daily-upgrade.timer` の窓 (06:00〜07:00) を避けるためで、理由はスクリプトの
+先頭に書いてある。
+
 両方とも `/tmp/kabu.lock` を共有する。DB と回線を分け合うので同時に走らせない。
 
 ## 開発
