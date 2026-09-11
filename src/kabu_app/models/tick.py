@@ -1,9 +1,9 @@
 """日次の株価."""
 
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import BigInteger, Date, Index, Numeric, String, Text
+from sqlalchemy import BigInteger, Date, DateTime, Index, Numeric, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from kabu_app.models.base import Base, TimestampMixin
@@ -16,8 +16,13 @@ class Tick(Base, TimestampMixin):
     """ある銘柄のある日の四本値と出来高.
 
     ``code`` に stocks への外部キーは張らない。上場廃止した銘柄の株価も残すため。
-    市場指数 (TOPIX の 998405 など) も同じ表に入る。個別株と並べてβや相対リターンを
-    計算するため。桁数で見分けられる。
+
+    市場指数は入れない。TOPIX (998405) の 638 行が findocgen から移って残っていたが、
+    2026-08-14 で止まったまま増えないので消した。Yahoo は指数の株価時系列ページを返さない。
+    ``.T`` も ``.O`` も HTTP 200 で戻るものの ``histories`` が空、``pager`` が null になる。
+    日経平均 (998407) も同じ。
+
+    ベンチマークが要るようになったら、JPX や日経が公開する指数データを別の経路で取ること。
 
     ``adjusted_close`` は株式分割を遡って調整した終値。Yahoo が分割のたびに過去まで
     書き換えるので、分割が起きた銘柄は全期間を取り直さないと古い値のまま残る。
@@ -36,7 +41,9 @@ class Tick(Base, TimestampMixin):
     )
 
     code: Mapped[str] = mapped_column(
-        String(8), primary_key=True, comment="JPX 銘柄コード。市場指数は 998405 のような 6 桁"
+        String(8),
+        primary_key=True,
+        comment="JPX 銘柄コード。4 桁英数字が基本。優先株・種類株は 5 桁。市場指数は入れない",
     )
     date: Mapped[date] = mapped_column(Date, primary_key=True, comment="取引日")
     open: Mapped[Decimal] = mapped_column(_PRICE, nullable=False, comment="始値 (円)")
@@ -82,4 +89,18 @@ class TickJumpCheck(Base, TimestampMixin):
         Text,
         nullable=True,
         comment="除外した理由。自動記録では空。「低位株の 1 円刻み」などを後から手で書く",
+    )
+    # TimestampMixin の汎用文を上書きする。この表では日時そのものが判定の記録にあたる
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+        comment="行の作成日時。この飛びを最初に確認した日時にあたる",
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+        comment="行の更新日時。同じ飛びを再確認するたびに更新される",
     )

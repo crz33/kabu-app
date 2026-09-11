@@ -36,6 +36,7 @@ class TdnetDisclosure(Base, TimestampMixin):
     __table_args__ = (
         Index("ix_tdnet_disclosures_disclosed_date", "disclosed_date"),
         Index("ix_tdnet_disclosures_code_disclosed_date", "code", "disclosed_date"),
+        Index("ix_tdnet_disclosures_code_fiscal_year_end", "code", "fiscal_year_end"),
         {"comment": "TDnet の適時開示のメタデータ (決算短信とその訂正)"},
     )
 
