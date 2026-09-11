@@ -2,23 +2,14 @@
 
 kabu の本番コード。取得バッチ、DB スキーマ、XBRL パーサ。**public**。
 
-Mac で開発し、ラズパイが pull して実行する。バッチは cron で回し、冪等に作る。
+## 構成
 
-## いま揃っているもの
+2 台で動かす。手元の開発機でコードを書き、常時稼働する本番機が pull して cron で回す。
+ここでは開発機が Mac、本番機がラズパイ + 直付けの SSD になる。以降もこの呼び方で書く。
+バッチは冪等に作り、同じ日に 2 回走っても壊れないようにする。
 
-| データ | 件数 | 期間 |
-| --- | --- | --- |
-| 有報の解析 | 8,323 書類 / 600 万ファクト | 2025-01 以降の提出分 |
-| 有報の名寄せ | 217,210 行 (6 項目) | 2014-03 期 〜 3,958 銘柄 |
-| 短信の解析 | 26,138 書類 / 表紙 156 万行 + 財務諸表 699 万行 | 2025-01 以降の開示 |
-| 短信の名寄せ | 301,070 行 (6 項目) | 2022-12 期 〜 3,791 銘柄 |
-| 株価 | 236 万行 | 2024-01 以降 |
-
-名寄せの 6 項目は売上高・営業利益・経常利益・当期純利益・総資産・純資産。有報と短信で同じ
-定義を使うので、`latest_financials` から一緒に引ける。会社予想は短信の表紙にしか無い。
-
-有報は 5 期分を載せるので、2025 年以降の書類しか無くても 2014 年まで遡れる。EDINET API は
-直近 5 年しか引けないため、これが過去に伸ばす唯一の手になる。
+kabu という投資判断システムの一部で、隣に 2 つある。`kabu-terminal` が作業ルート、
+`kabu-lab` が分析側。どちらもこのリポジトリからは参照しない。
 
 ## 開発環境
 
@@ -169,687 +160,170 @@ uv run alembic upgrade head --sql    # DB に触らず SQL を確認
 
 JPX の銘柄一覧 (`data_j.xls`) には `日付` 列があり、これが基準日になる。JPX は月末時点のデータを 1 か月ほど遅れて公開するため、取得日とは一致しない。`stock_snapshots.base_date` にはこの `日付` 列を使う。
 
-## EDINET
-
-有価証券報告書 (`120`) と訂正有価証券報告書 (`130`) を取得する。証券コードを持つ提出者
-だけが対象になる。非上場の会社やファンドも有報を出すため、一覧の 1 割ほどしか残らない。
-
-銘柄マスタとの突合はしない。上場廃止した会社の有報も入れる。`stocks` は JPX の最新一覧から
-作るので、買収や MBO で消えた会社は載らない。ここで捨てると、過去を評価するときに生存者
-バイアスが入る。2025 年の 10 か月で、有報を出した銘柄の 7% が今の一覧から消えていた。
-上場中に絞りたい分析は `stocks` と結合する。
+列ごとの意味は書き写さない。すべての表と列に `COMMENT` が付いているので `psql` で読む。
 
 ```bash
-uv run kabu fetch edinet                    # 前回の続きから今日まで
-uv run kabu fetch edinet --from 2025-01-06  # 開始日を指定する
-uv run kabu fetch edinet --skip-download    # メタデータだけ入れる
-uv run kabu fetch edinet --max-download 200 # ZIP の取得を 200 件で打ち切る
+psql "$DATABASE_URL" -c '\d+ edinet_financials'
 ```
 
-`--from` を省くと `edinet_documents` の最新提出日から取り直す。その日をもう一度引くのは、
-同じ日に後から提出された書類を拾うため。書類は `doc_id` で upsert するので重複しない。
+## どれを引くか
 
-ZIP は `<KABU_DATA_DIR>/edinet/YYYYMMDD/{docID}.zip` に置く。既にファイルがあれば落とさず
-記録だけ付ける。取得に失敗した書類は `downloaded_at` が NULL のまま残り、次の実行が提出日に
-かかわらず拾い直す。取得済みの日を記録するテーブルは持たない。失敗した日を「済み」と
-書いてしまう事故のほうが、空振りの一覧取得より高くつくため。
+テーブルの一覧より、こちらのほうが早く着く。
 
-API キーは `EDINET_API_KEY` に入れる。キーが無効でも EDINET は HTTP 200 を返すので、本文の
-`StatusCode` を見て落とす。見落とすと「対象 0 件」で静かに完走してしまう。
+| 知りたいこと | 引き先 |
+| --- | --- |
+| 実績の財務 6 項目 | `latest_financials` |
+| ある時点で分かっていた値 | `financials` を `available_at` で絞る |
+| 会社予想 | `tdnet_summary_facts` の `fact_type = 'Forecast'` |
+| 四半期の実績 | `tdnet_financials`。`period_kind` で累計と単独を選ぶ |
+| 6 項目に無い勘定 | `edinet_latest_facts` / `tdnet_statement_facts` |
+| セグメント別の値 | `edinet_facts` の `member` が非 NULL の行 |
+| 計算書を刷られた形で読む | `edinet_statement_lines` |
+| 株価・出来高 | `ticks`。長期の比較は `adjusted_close` |
+| 大株主・オーナー比率 | `edinet_shareholders` |
 
-### 初回のバックフィル
+名寄せの 6 項目は売上高・営業利益・経常利益・当期純利益・総資産・純資産。定義は
+`src/kabu_app/normalizers/financials.py` の `ITEM_SPECS` にある。
 
-前身の findocgen が 2025-01-06 以降の ZIP を `/mnt/usb/data/edinet/` に残している。同じ配置を
-引き継ぐので、メタデータを入れ直せばファイルの再取得は起きない。
+実績を `tdnet_summary_facts` から引かないこと。表紙は百万円に丸めてある。表紙を読むのは
+会社予想のためになる。
+
+### どのコマンドが埋めるか
+
+| コマンド | 埋まるテーブル |
+| --- | --- |
+| `kabu fetch jpx-stocks` | `stocks` / `stock_snapshots` |
+| `kabu fetch edinet` | `edinet_documents` (メタと ZIP の状況) |
+| `kabu parse edinet` | `edinet_facts` / `edinet_document_labels` / `edinet_shareholders` |
+| `kabu normalize financials` | `edinet_financials` |
+| `kabu fetch tdnet` | `tdnet_disclosures` (メタと実体の状況) |
+| `kabu parse tdnet` | `tdnet_summary_facts` / `tdnet_statement_facts` |
+| `kabu normalize tdnet-financials` | `tdnet_financials` |
+| `kabu fetch ticks` | `ticks`。`--only-jumps` のときだけ `tick_jump_checks` も |
+| `kabu parse taxonomy YYYY` | `edinet_labels` |
+
+`fetch` と `parse` は同じメタデータ表を 2 段階で埋める。`parse` が
+`accounting_standard` `is_consolidated` `fiscal_year_end` `parsed_at` を後から入れる。
+`downloaded_at` や `parsed_at` が NULL の行は未処理で、次の実行が拾い直す。
+
+`kabu parse taxonomy` だけはバッチに入っていない。ZIP を手で置いてから流す。
+
+### 生ファイルの置き場
+
+`KABU_DATA_DIR` の下に取得元ごとに分ける。
+
+| パス | 中身 |
+| --- | --- |
+| `jpx/stock_list/data_j_YYYYMMDD.xlsx` | JPX 東証上場銘柄一覧 |
+| `edinet/YYYYMMDD/{docID}.zip` | 有報の XBRL 一式。ディレクトリは提出日 |
+| `tdnet/YYYYMMDD/{docID}.zip` | 短信の XBRL 一式。ディレクトリは開示日 |
+| `tdnet/YYYYMMDD/{docID}.pdf` | XBRL が無い開示の本体 |
+| `edinet_taxonomy/Taxonomy_YYYY.zip` | 金融庁のタクソノミ。手で置く |
+
+## 使い方
+
+取得と解析と名寄せを分けてある。どれも冪等で、途中で止めても同じコマンドを叩き直せば残り
+だけを処理する。
 
 ```bash
+uv run kabu fetch jpx-stocks                    # 銘柄一覧。月次更新だが毎晩流してよい
+uv run kabu fetch edinet                        # 前回の続きから今日まで
+uv run kabu fetch tdnet                         # 同上。31 日より前は取れない
+uv run kabu fetch ticks                         # 銘柄ごとに最新取引日から。2 時間かかる
+uv run kabu fetch ticks --only-jumps            # 調整後終値が飛んでいる銘柄だけ取り直す
+uv run kabu parse edinet                        # 未解析の有報を解析する
+uv run kabu parse tdnet                         # 未解析の短信を解析する
+uv run kabu parse taxonomy 2026                 # タクソノミの標準ラベルを入れる
+uv run kabu normalize financials                # 有報のファクトを 6 項目に寄せる
+uv run kabu normalize tdnet-financials          # 短信の添付を同じ 6 項目に寄せる
+```
+
+主な option は 3 系統ある。`--help` に全部載っている。
+
+| option | 効き方 |
+| --- | --- |
+| `--from` / `--to` | 対象の日付を指定する。省くと取り込み済みの続きから今日まで |
+| `--max-download` / `--max-documents` / `--max-codes` | 1 回の実行で扱う数を打ち切る |
+| `--reparse` / `--renormalize` / `--doc-id` | 済みのものをやり直す。パーサや項目の定義を直したとき |
+
+失敗した書類は `downloaded_at` や `parsed_at` が NULL のまま残り、次の実行が拾い直す。理由は
+`parse_error` に入る。取得済みの日を記録するテーブルは持たない。失敗した日を「済み」と書いて
+しまう事故のほうが、空振りの一覧取得より高くつくため。
+
+項目の定義を変えたときはバッチ任せにせず、手で `--renormalize` を流すこと。ファイルは読まず
+ファクトから作り直すので、有報の全件で 9 分で済む。
+
+## 設計の理由はコードにある
+
+なぜこの形なのかは、判断した場所の docstring に書いてある。ここには書き写さない。2 か所に
+置くと必ず片方が古くなる。
+
+| 知りたいこと | 読む先 |
+| --- | --- |
+| 有報の XBRL をどう読むか | `parsers/edinet_xbrl.py` |
+| 表示順と階層の作り方 | `parsers/edinet_xbrl.py` の `_build_lines` まわり |
+| 大株主のオーナー判定 | `parsers/shareholders.py` |
+| タクソノミのラベル | `parsers/taxonomy.py` と `models/edinet.py` の `EdinetLabel` |
+| 短信の iXBRL をどう読むか | `parsers/tdnet_xbrl.py` |
+| 6 項目への名寄せ | `normalizers/financials.py` |
+| 短信の期の数え方 | `normalizers/tdnet_financials.py` |
+| 連結と単体の切り替え | `stores/edinet_financial.py` と `stores/tdnet_fact.py` |
+| 各表と列の意味 | `models/` と DB の `COMMENT` |
+| ビューの選び方と `available_at` | ビューを作った migration |
+| 訂正有報を取り込む判断 | `migrations/versions/20260823_0008_*.py` |
+| 株価の取得と締め出し | `collectors/yahoo.py` |
+| TDnet が 31 日で消える扱い | `collectors/tdnet.py` |
+| バッチの順序とロック | `scripts/nightly.sh` と `scripts/weekly_ticks.sh` |
+
+## 遡れる範囲
+
+いま入っているデータには始点がある。分析に効くのでここに書く。
+
+- **EDINET の取得は 2025-01-06 から。** それ以前に提出された書類は入っていない。2024 年より
+  前の期のデータは「2025 年以降の書類が報告した過去の期」として入っており、その期の当時の
+  報告そのものではない
+- **有報は「主要な経営指標等」に 5 期分を載せる。** これが過去に伸ばす唯一の手になる。
+  EDINET API は直近 5 年しか引けない。営業利益だけは載らないので当期と前期の 2 期になる
+- **TDnet は取り逃すと二度と取れない。** 一覧も実体も 31 日で消える。バッチを 1 か月止めると
+  その期間は永久に欠ける
+- **株価は findocgen から引き継いだぶんの `adjusted_close` が NULL。** 分割のあった銘柄は
+  夜間バッチが 1 晩 50 銘柄ずつ取り直している
+
+## findocgen からの移行
+
+前身の findocgen から株価とメタデータを引き継いだ。どれも 1 度だけ流す。
+
+```bash
+# 株価 234 万行。ticks が空のときだけ
+FINDOCGEN_DATABASE_URL="$(grep '^DATABASE_URL=' ~/findocgen/.env | cut -d= -f2-)" \
+  ./scripts/import_findocgen_ticks.sh
+
+# 短信のメタデータ。実体は置き場にあるが、メタは findocgen にしかない
+FINDOCGEN_DATABASE_URL="$(grep '^DATABASE_URL=' ~/findocgen/.env | cut -d= -f2-)" \
+  ./scripts/import_findocgen_tdnet.sh
+
+# 有報は ZIP を引き継ぐだけ。メタデータを入れ直せば再取得は起きない
 uv run kabu fetch edinet --from 2025-01-06
 ```
 
-日数ぶんの一覧取得が走る。ZIP は既存ぶんを再利用し、findocgen が取っていなかった訂正有報
-だけが新しく落ちる。
-
-## 有報の解析
-
-取得済みの ZIP から財務諸表の数値と大株主を取り出し、`edinet_facts` と
-`edinet_shareholders` に入れる。書類単位で消してから入れ直すので、同じ書類を何度解析しても
-壊れない。
-
-```bash
-uv run kabu parse edinet                       # 未解析の書類をすべて
-uv run kabu parse edinet --max-documents 100   # 100 件で打ち切る
-uv run kabu parse edinet --reparse             # 解析済みもやり直す。パーサを直したとき
-uv run kabu parse edinet --doc-id S100YW7F     # 書類を指定する
-uv run kabu parse taxonomy 2026                # タクソノミの日本語ラベルを入れる
-```
-
-失敗した書類は `parsed_at` が NULL のまま残り、次の実行が拾い直す。理由は `parse_error` に
-入る。10 件続けて失敗したら中断する。ZIP の置き場ごと見えていない場合など、続けても
-直らない壊れ方をしているため。
-
-訂正有価証券報告書 (`130`) も解析する。**様式は有報と同じで、このパーサでそのまま読める**。
-585 件を試して全件が解析できた。
-
-585 組を元と比べると 74 組 (12.6%) で数値が動く。純資産・総資産・自己資本比率・EPS・
-経常利益・ROE といった中核が変わり、幅も小さくない。Abalance は EPS が 53.50 から -17.65
-になり、黒字が赤字に反転していた。全 7,150 書類で見れば 1% 前後だが、A 能力スコアの土台が
-動く。取り込む価値はある。
-
-**訂正報告書は差分ではなく全文**になる。585 組すべてでファクト数の比が 0.99〜1.02 に収まり、
-セクションが欠ける組は無かった。だから元とマージする必要はなく、その期の最新の書類を採れば
-よい。
-
-マージはむしろ誤りになる。訂正側で消えるファクトが 18 組 68 件あり、中身は PER・ROE・
-希薄化 EPS・配当性向だった。赤字だと PER は算定できず有報に載らない。訂正で損益が動いた
-結果として消えているので、元から拾い直すと算定不能な値が残る。
-
-### 数値を読むのに要る情報は書類に持たせる
-
-`edinet_documents` は解析のときに XBRL の DEI から 4 つを埋める。会計基準
-`accounting_standard`、連結の有無 `is_consolidated`、会計年度の `fiscal_year_start` /
-`fiscal_year_end`。同じ勘定でも連結と単体では意味が違い、会計基準が変われば使う要素名も
-変わるので、ファクトを読む前にこれが要る。
-
-ファクト側から推測はできるが、当てにしない。**US GAAP は日本 GAAP と要素の名前空間が同じ**で
-見分けられない (880 書類の実測では US GAAP が 1 件も出ず、判別条件を確かめられなかった)。
-IFRS でも `jppfs` の要素が混ざる書類がある。連結の有無を `BR_C` セクションの有無から逆算する
-のも、パーサのセクション割り当てを変えると壊れる。
-
-### 1 行 1 数値で持つ
-
-財務諸表は 5 つに絞る。`BR` (主要な経営指標等の推移)、`BR_C` (同じく提出会社)、`BS`、`PL`、
-`CS`。株主資本等変動計算書・包括利益計算書・注記は取らない。1 書類あたり 700 行ほど、
-6800 書類で 500 万行になる。
-
-**`context_ref` を主キーに含めるのが要点**。同じ勘定・同じ期間でも、連結全体の値と
-セグメント別の値が並んで出てくる。実データでは営業利益の 7 割の書類でセグメント別が同居
-していた。連結全体だけが欲しいときは `member IS NULL` で絞る。
-
-```sql
-SELECT d.filer_name, l.label, f.period_end, f.value
-FROM edinet_facts f
-JOIN edinet_documents d ON d.doc_id = f.doc_id
-JOIN edinet_labels   l ON l.concept = f.concept
-WHERE f.concept = 'jppfs_cor_OperatingIncome'
-  AND f.section = 'PL'
-  AND f.member IS NULL
-ORDER BY f.period_end DESC;
-```
-
-値は**円**で入る。有報の表は百万円単位で刷られるが、XBRL の中身は円で、桁を丸めるのは表示
-側の仕事になる。`decimals` は原文の精度表示をそのまま残したもので、値のスケールとは関係
-しない。前身の findocgen は「百万円」と注記していたが、実際には円だった。
-
-### 計算書の形で読む
-
-`ordinal` と `depth` を持たせてあるので、有報に刷られた表をそのまま並べ直せる。`ordinal` は
-表示リンクを深さ優先でたどった通し番号、`depth` は階層の深さになる。ビューを用意してある。
-
-```sql
-SELECT depth, label, value
-FROM edinet_statement_lines
-WHERE doc_id = 'S100YWGX' AND section = 'PL' AND member IS NULL
-  AND period_end = '2026-05-31'
-ORDER BY ordinal;
-```
-
-```text
-売上高                        130,123,000,000
-売上原価                       56,295,000,000
-売上総利益又は売上総損失（△）           73,827,000,000
-  給料及び手当                    7,402,000,000
-  パート・アルバイト給与              20,654,000,000
-  販売費及び一般管理費               69,422,000,000
-営業利益又は営業損失（△）              4,405,000,000
-```
-
-表示リンクの節点は locator ではなく**勘定**にしてある。同じ勘定に locator が 2 つ振られる
-ことがあり、locator を単位に木を作ると根が分裂して途中で切れる。
-
-### ラベルは 2 段に分ける
-
-要素名の日本語ラベルは 2 つのテーブルに分けて持つ。500 万行それぞれに文言を持たせると同じ
-文字列が何百万回も重複するので、表示のときだけ結合する。
-
-| テーブル | 中身 | 入れ方 |
-| --- | --- | --- |
-| `edinet_labels` | 金融庁のタクソノミが定める標準ラベル | `parse taxonomy` |
-| `edinet_document_labels` | その書類での言い換え。会社独自の拡張要素も | `parse edinet` |
-
-**書類ごとに分けるのが要点**。会社は標準の勘定に独自の文言を付ける。`jppfs_cor_OperatingIncome`
-に「セグメント利益」と書く会社があり、全社で 1 行にまとめると他社の営業利益にもそれが出る。
-実測で、書類が独自ラベルを付けた標準要素 141 個のうち 20 個が会社ごとに割れていた。
-
-引くときは書類固有を優先し、無ければ標準に落とす。上のビューがこれをやっている。
-
-```sql
-COALESCE(dl.label, l.label)
-```
-
-タクソノミの ZIP は **API では取れない**。金融庁の「EDINET タクソノミ及びコードリスト」の
-ページから落として置く。
-
-```text
-<KABU_DATA_DIR>/edinet_taxonomy/Taxonomy_2026.zip
-```
-
-年 1 回、新しい年度が公開されたら流す。**古い年度から順に流すこと**。同じ要素は後から流した
-方で上書きされるので、逆順だと古い文言が残る。
-
-2024・2025・2026 の 3 年で文言が変わったのは 14 要素だけ。10 件は送り仮名や法令の条番号で、
-2 件は 2024 版で項目名の位置に使い方の説明が入っていたものの修正になる。
-
-残る 4 件は勘定科目名で、新リース会計基準に伴う「リース債務」から「リース負債」への言い換え。
-指す対象は同じだが、2026 版を流すと過去の有報にも新しい用語が出る。書類同梱のラベルは
-実測 161 件すべてで無かったので、ここはタクソノミの文言がそのまま表示される。
-
-```text
-jppfs_cor_LeaseObligationsCL / NCL             リース債務       → リース負債
-jppfs_cor_RepaymentsOfLeaseObligationsFinCF    リース債務の返済  → リース負債の返済
-jppfs_cor_IncreaseDecreaseInLeaseObligationsOpeCF               同上
-```
-
-分析には効かない。KPI も集計も要素名で引くため。原本どおりの文言で表示したくなったら、
-主キーを `(taxonomy_year, concept)` にして書類の年度で引く形に変える。そのときは提出日から
-年度を決める処理が要る。前身の findocgen はこれを持っていて、書類ごとの例外を TOML で
-手当てしていた。4 要素のために戻すには重いと判断した。
-
-年度は列に持たない。持たない代わりに、要素は消さずに溜める。upsert なので複数年を流すと
-和集合になり、廃止された要素も残る。2024・2025・2026 を流すと 9,041 要素で、2026 単体の
-8,298 より多い。
-
-過去のタクソノミを集め直す必要は無い。2022 年提出の有報でも、2024 年以降の 3 年分で
-勘定の 98.2% が引けた。残りは書類に同梱されており、どちらでも引けない勘定は 0% だった。
-年度で入れ替わるのは四半期報告書まわりの要素で、財務諸表の勘定は動かないため。
-
-### 大株主とオーナー判定
-
-有報の「大株主の状況」から上位 10 名を取り、`kind` で分類する。個人・役員・資産管理会社を
-オーナー系 (`is_owner`) として合算できる。
-
-```sql
-SELECT s.code, d.filer_name,
-       sum(s.ratio) FILTER (WHERE s.is_owner) AS owner_ratio,
-       sum(s.ratio)                           AS top_ratio
-FROM edinet_shareholders s
-JOIN edinet_documents d ON d.doc_id = s.doc_id
-GROUP BY s.code, d.filer_name;
-```
-
-判定は株主名の文字列からの推定で、外れる例が残る。根拠を追えるよう `name` と `kind` を必ず
-一緒に持つ。信託口とカストディは名義人なので外し、役員と同姓でも金融機関はオーナー家の
-ビークルとみなさない。松井証券のように、たまたま同姓の独立した会社を取り違えるため。
-
-役員の姓は名前の先頭 2〜3 文字から取る。空白では切れない。有報の役員名は「南 部　真 希 也」
-のように 1 文字ずつ空けて均等割り付けする書き方が多く、空白で分けると「南」しか残らない。
-
-## 財務項目の名寄せ
-
-`edinet_facts` は XBRL の要素名のままなので、会社をまたいで並べられない。売上高は日本 GAAP が
-`jppfs_cor_NetSales`、IFRS が `jpigp_cor_RevenueIFRS`、鉄道会社は
-`jppfs_cor_OperatingRevenueRWY` になる。共通の `item` に寄せた層が `edinet_financials`。
-
-```bash
-uv run kabu normalize financials                     # 未処理の書類をすべて
-uv run kabu normalize financials --max-documents 100 # 100 件で打ち切る
-uv run kabu normalize financials --renormalize       # 済みもやり直す。項目を直したとき
-```
-
-ファイルは読まない。`edinet_facts` から作るので、ZIP の取り直しも解析のやり直しも要らない。
-項目の定義を変えたら `--renormalize` で全件を作り直す。解析し直すよりずっと速い。
-
-### 第 1 弾は 6 項目
-
-| `item` | 内容 |
-| --- | --- |
-| `net_sales` | 売上高。IFRS の売上収益、業種ごとの営業収益もここに寄せる |
-| `operating_income` | 営業利益 |
-| `ordinary_income` | 経常利益。IFRS と US GAAP は概念が無いので税引前利益で代える |
-| `net_income` | 当期純利益。親会社帰属を優先する |
-| `total_assets` | 総資産 |
-| `net_assets` | 純資産 |
-
-これで営業利益率・総資産回転率・ROA・ROE の 3 分解・売上成長率まで届く。1 株当たりの値や
-キャッシュフローは、見ると決めたときに足す。
-
-`net_assets` は日本 GAAP の純資産で、非支配株主持分と新株予約権を含む。IFRS の親会社所有者
-帰属持分とは範囲が違う。自己資本が要るなら別項目として足すこと。前身の findocgen はこれを
-`Equity` という名前で持っていて、名前と中身がずれていた。
-
-### 出所を必ず残す
-
-`source_section` と `source_concept` に、どこから寄せたかを持つ。金融業の経常収益を売上高に
-寄せるような判断が入るため、出所を捨てると値がおかしいときに切り分けられない。欠損なのか、
-名寄せの取り違えなのか、そもそも概念が違うのかが追えなくなる。
-
-```sql
-SELECT code, period_end, value / 1e6 AS 百万円, source_section, source_concept
-FROM edinet_latest_financials
-WHERE item = 'net_sales' AND code = '2168'
-ORDER BY period_end;
-```
-
-### 営業利益だけ 2 期になる
-
-「主要な経営指標等の推移」(`BR`) は 5 期分を載せる。だから 2026 年の有報からは 2022 年の
-売上高まで取れる。EDINET API は直近 5 年しか遡れないので、過去に伸ばす手として効く。
-
-営業利益だけは `BR` から取れない。タクソノミに
-`jpcrp_cor_OperatingIncomeLossSummaryOfBusinessResults` が存在せず、有報の表にも刷られない。
-`PL` から取るため当期と前期の 2 期になる。欠損ではない。
-
-同じ期が `BR` と `PL` の両方にあるときは `BR` を採る。会社が経営指標として明示的に載せた値で、
-5 期分そろうため。実測では値が一致した (パソナ 2025 年 5 月期の売上高が両方 309,240 百万円)。
-
-営業利益はそもそも取れない会社がある。8,323 書類のうち当期の 6 項目がそろうのは 95.9% で、
-欠けの内訳は営業利益 325 件、売上高 21 件、経常利益 5 件だった。営業利益の 325 件は日本 GAAP
-225 件・IFRS 88 件・US GAAP 12 件で、銀行と保険が中心になる。**IFRS には営業利益の定義が
-無い**ので、開示しない企業がある。税引前利益で代えることはしない。定義の違う値を同じ列に
-入れると、営業利益率が会社ごとに別の意味になるため。
-
-### 単体決算の会社は member が付く
-
-連結財務諸表を作らない会社は、経営指標の推移も損益計算書もすべて `NonConsolidatedMember`
-付きで書く。実測では単体決算 765 書類のうち、`BR` に `member IS NULL` の数値を持つものが
-1 件も無かった。連結企業と同じ条件で引くと、この 765 書類から 1 項目も取れない。
-
-そこで `edinet_documents.is_consolidated` で入力を切り替える。連結企業は `member IS NULL`
-だけ、単体決算の会社は `NonConsolidatedMember` も通す。連結企業でこれを混ぜると、`BR_C` の
-単体の数値が入り込む。
-
-`NonConsolidatedMember_ShareholdersEquityMember` のように後ろが続くものは株主資本等変動
-計算書の内訳なので、完全一致だけを見て通さない。
-
-### 売上だけラベルで受ける
-
-営業収益は業種ごとに要素名が分かれる。タクソノミには鉄道 (`RWY`)・高速道路 (`HWY`)・電力
-(`ELC`)・証券 (`SEC`)・投資 (`INV`) など 20 以上の派生があり、会社独自の拡張要素を使う会社も
-ある。全部を要素名で並べるより、日本語ラベルで受けるほうが保守が続く。
-
-要素名で拾えなかった期にだけ効く。同じ期に複数あれば合計行とみて大きいほうを採る。他の
-5 項目は標準要素で足りるので持たせていない。
-
-### 円とは限らない
-
-`unit` は元のファクトのものをそのまま持つ。ほとんど `JPY` になるが、米ドル建てで決算を出す
-会社がある。三井海洋開発 (6269) の売上高は `USD` で入る。
-
-集計するときは必ず `unit` で絞ること。円と混ぜると、その会社だけ桁が 2 つずれた値になる。
-為替で換算はしない。どのレートを使うかは分析側の判断で、名寄せの仕事ではないため。
-
-```sql
-SELECT code, period_end, value / 1e6 AS 百万円
-FROM edinet_latest_financials
-WHERE item = 'net_sales' AND unit = 'JPY';
-```
-
-### 期ごとに 1 行を選ぶ
-
-同じ期の売上高が複数の書類から出てくる。5 期分を載せる書類が重なるうえ、訂正有報も別の行に
-なる。`edinet_latest_financials` が会計年度末のいちばん新しい書類を選ぶ。その期を当期として
-書いた書類の値になり、訂正があればそれが採られる。
-
-## TDnet
-
-決算短信とその訂正を取得する。表題に「決算短信」を含む開示をすべて残す。「決算短信の
-発表日変更のお知らせ」のような短信そのものでない開示も混じるが、捨てずに入れる。実体を
-落とすかどうかは XBRL の有無で決める。
-
-```bash
-uv run kabu fetch tdnet                     # 前回の続きから今日まで
-uv run kabu fetch tdnet --from 2026-08-15   # 開始日を指定する
-uv run kabu fetch tdnet --skip-download     # メタデータだけ入れる
-```
-
-### 31 日で消える
-
-EDINET と一番違うのはここ。一覧ページも実体ファイルも 31 日ほどで消える。**取り逃した日は
-二度と取れない**。日次バッチを止めたまま 1 か月放置すると、その期間は永久に欠ける。
-
-未取得のリトライも 31 日以内に限っている。それより古いものは何度叩いても 404 が返るだけ
-なので、`pending_disclosures` が最初から対象にしない。取り逃した件数は実行の最後に警告で
-出る。数が増えていたらバッチが止まっている。
-
-### XBRL が無い短信はごく少ない
-
-**決算短信 24,889 件のうち XBRL が付かないのは 47 件 (0.19%)** だった。ZIP の無い開示は
-全体で 295 件あるが、234 件は「決算短信の発表日変更のお知らせ」のような短信そのものでない
-開示で、17 件が訂正になる。
-
-以前ここに「1 割ほどに XBRL が付かない」と書いていたが誤りだった。全 26,138 件を解析して
-実測した数字に置き換えてある。
-
-そこで **PDF は必ず落とし、XBRL があるときだけ ZIP も落とす**。ZIP しか無い開示があると、
-本文を読むのに 2 系統の処理が要る。同じ会社の短信を時系列で並べたときに読み方が変わるのが
-一番厄介なので、どの開示も PDF で読めるようにしてある。findocgen の既存 2 万件も両方持って
-いるので、そこと地続きになる。
-
-数値は ZIP から取る。XBRL の無い 47 件だけは PDF から読むしかない。
-
-実体は `<KABU_DATA_DIR>/tdnet/YYYYMMDD/{docID}.pdf` と `.zip` に置く。findocgen と同じ配置
-なので、既存ぶんは落とし直さない。PDF は平均 471KB、年 9GB ほど増える。
-
-## 決算短信の解析
-
-取得済みの ZIP から数値を取り出す。書類単位で消してから入れ直すので、同じ開示を何度解析
-しても壊れない。
-
-```bash
-uv run kabu parse tdnet                          # 未解析の開示をすべて
-uv run kabu parse tdnet --max-disclosures 100    # 100 件で打ち切る
-uv run kabu parse tdnet --reparse                # 解析済みもやり直す。パーサを直したとき
-uv run kabu parse tdnet --doc-id 140120260820523427
-```
-
-XBRL の付かない短信は最初から対象にしない。1 割ほどが PDF だけで、数値はどうやっても
-取れない。失敗した開示は `parsed_at` が NULL のまま残り、次の実行が拾い直す。
-
-### ZIP に体系の違う 2 系統が入っている
-
-有報と一番違うのはここ。同じ ZIP の中で要素名の体系がまるごと変わる。
-
-| | `XBRLData/Summary/` | `XBRLData/Attachment/` |
-| --- | --- | --- |
-| 名前空間 | `tse-ed-t` の独自体系 | `jppfs_cor` / `jpigp_cor` (有報と同じ) |
-| 会社予想 | **あり** (来期・レンジの上下限) | なし |
-| 実績の精度 | 百万円に丸め | 円単位 |
-| 内訳 | 売上高・営業利益など集約値だけ | PL 21〜35 / BS 49〜52 / CF 41〜52 要素 |
-| セグメント | なし | あり |
-| 入れ先 | `tdnet_summary_facts` | `tdnet_statement_facts` |
-
-**実績は添付、予想は表紙**という分担になる。同じ売上高が表紙で 138,877 (百万円)、添付で
-138,877,139 (円) になり、表紙は千円以下を捨てている。表紙を読むのは予想のためだけになる。
-
-添付は有報とまったく同じ要素名なので、`edinet_financials` の名寄せがそのまま効く。有報が
-年 1 回なのに対しこちらは四半期ごとに入るので、粒度が上がる。
-
-### context が別のファイルにある
-
-添付は 6 本前後の iXBRL で 1 つの XBRL インスタンスを組む。**`context` と `unit` の定義は
-先頭の 1 本 (たいてい貸借対照表) にしかまとめられていない**。残りの計算書は参照するだけに
-なる。1 本ずつ独立に読むと、2 本目から期間が引けずファクトが 1 つも取れない。
-
-IFRS の会社は貸借対照表を `fs` (財政状態計算書) として出す。これを読み飛ばすと、その会社は
-定義ごと落ちて添付が丸ごと空になる。実測でこれを踏んだ。
-
-```text
-0101010-acbs01-...-ixbrl.htm   ← 1 文字目 a=通期 q=四半期 s=中間
-0102010-acpl01-...             ← 2 文字目 c=連結 n=単体
-0102020-acci01-...             ← 続く 2 文字が計算書
-```
-
-`np` と `nb` は載せない。実測ではどちらも数値を 1 つも持たず、注記の本文だけだった。
-
-### 主キーは通し番号にする
-
-`tdnet_statement_facts` の主キーは `(doc_id, ordinal)`。有報と違い、`concept` と
-`context_ref` の組では一意にならない。**株主資本等変動計算書は同じ勘定が表のセルとして
-何度も出る**ため。`ordinal` は書類ぜんぶを通した番号で、実測の最大は 1,056 だった。
-
-### 表紙の context は 4 軸の掛け合わせ
-
-有報の `member` と違い、決算短信の context は意味の決まった軸を並べたものになる。列に割って
-持つ。文字列のまま置くと、予想を引くたびに `LIKE '%ForecastMember'` を書くことになる。
-
-```text
-NextYearDuration_ConsolidatedMember_ForecastMember
- └ scope     Current (当期) / Prior (前期) / Next (来期)
-   └ period_kind  Year / AccumulatedQ1〜Q3
-     └ is_consolidated
-       └ fact_type   Result / Forecast / Upper / Lower
-```
-
-`Upper` と `Lower` は予想を幅で出す会社の上下限になる。要素としては全書類に置かれ、使わない
-会社では空のまま残る。**全 26,138 件では 309 書類で実際に値が入っていた**。会社予想を出す
-25,350 書類に対して 1.2% になる。
-
-findocgen の正規表現は `(Result|Forecast)Member$` で終わっており、この 309 書類の予想を丸ごと
-落としていた。少数だが、レンジで出す会社は業績の振れが大きい会社になる。捨てると、そういう
-会社だけ予想が無い状態になる。
-
-### 定性情報は iXBRL ではない
-
-`XBRLData/Attachment/qualitative.htm` に「経営成績等の概況」などの文章が入る。まだ取り込んで
-いないが、読むときのために分かったことを残す。
-
-**このファイルに XBRL のタグは付いていない。** `ix:nonNumeric` 要素が 1 つも無く、ただの
-HTML になる。要素名で引くことはできない。
-
-それでも文章の分析には PDF より向く。見出しの階層がそのまま残るため。
-
-```text
-○添付資料の目次
-１．経営成績等の概況
-（１）当期の経営成績の概況
-  ① 不動産関連事業
-  ② 人材サービス関連事業
-（２）当期の財政状態の概況
-```
-
-PDF はレイアウト解析が要り、表が崩れ、段組みで文の順が入れ替わる。見出しの階層も失われるので
-「経営成績の概況」と「業績予想の根拠」を切り分けにくい。HTML ならテキストがそのまま抜ける。
-
-気をつける点が 2 つある。見出しの文言は会社ごとに揺れるので、`①` や `（１）` の形に頼った
-切り分けは壊れる。それと表が `<table>` で入っているため、素朴にテキスト化すると数字が文章に
-混ざる。
-
-### 書類の素性は表題から読む
-
-有報の DEI にあたるものが決算短信には無い。表紙の `DocumentName` に会計基準と連結の有無が
-入っている。実測 260 書類すべてにあった。
-
-```text
-第１四半期決算短信〔日本基準〕（連結）
-第２四半期（中間期）決算短信〔ＩＦＲＳ〕(連結)
-決算短信〔日本基準〕（非連結）
-```
-
-括弧は全角と半角が混ざる。四半期は `QuarterlyPeriod` を優先し、無ければ表題から読む。この
-要素は通期の短信に入らず、実測では 60 件中 43 件にしかなかった。
-
-### 値は scale と sign を当ててから入れる
-
-iXBRL の数値は原文のまま置かれ、桁と符号が属性で別に来る。`scale="6"` なら百万円単位で
-刷られているので掛けて円に直す。`sign="-"` は表に △ で刷られる値に付き、実測 60 書類で
-488 件あった。落とすと赤字が黒字のまま入る。
-
-## 短信の財務項目の名寄せ
-
-添付を有報と同じ 6 項目に寄せて `tdnet_financials` に入れる。
-
-```bash
-uv run kabu normalize tdnet-financials                      # 未処理の開示をすべて
-uv run kabu normalize tdnet-financials --max-disclosures 100
-uv run kabu normalize tdnet-financials --renormalize        # 済みもやり直す
-```
-
-**項目の定義は有報と共有する。** 添付は `jppfs_cor` / `jpigp_cor` と有報とまったく同じ体系
-なので、`normalizers.financials.ITEM_SPECS` がそのまま効く。実測では PL / BS のエントリ
-18 個のうち 15 個が短信でも当たり、売上の取りこぼしは無かった。定義を 2 つ持つと片方だけ
-直す事故が起きる。
-
-### 累計と単独四半期を取り違えない
-
-有報は `period_end` だけで期が決まった。短信は同じ期末に**年初来累計と単独四半期**が並ぶ。
-「Q2 累計 100 億」と「Q2 単独 50 億」は別物なので、`period_kind` を主キーに含める。
-
-| `period_kind` | context | 中身 |
-| --- | --- | --- |
-| `ytd` | `CurrentYTDDuration` | 年初来累計。四半期短信の主軸 |
-| `quarter` | `CurrentQuarterDuration` | 単独四半期。出す会社は少ない |
-| `year` | `CurrentYearDuration` | 通期 |
-| `interim` | `InterimDuration` | 中間期 |
-| `quarter_end` | `CurrentQuarterInstant` | 四半期末の時点。BS |
-| `year_end` | `Prior1YearInstant` など | 期末の時点。BS |
-
-`period_start` から期間の長さを計算しても大半は判別できる。しかし決算期を変えた会社で狂う。
-実際に「第５四半期決算短信」を出す会社がある。context に書いてあるものを読む。
-
-`period_kind` は context の最初の `_` より前だけを見る。単体決算の会社は
-`CurrentQuarterInstant_NonConsolidatedMember` の形になり、末尾で合わせると 763 書類が丸ごと
-落ちる。
-
-### 絞りには 2 つの軸が要る
-
-添付はファイルが連結と単体で分かれており、その中の context にも区分が入る。連結企業は連結の
-ファイルを見て `member IS NULL` を採る。単体決算の会社は `NonConsolidatedMember` も通す。
-実測 763 書類では `member IS NULL` の行が書類あたり 1 つしかなく、中身は提出回数の DEI
-だった。**有報とまったく同じ構造**になる。
-
-`pc` の計算書は名寄せのときだけ `PL` に寄せる。`pc` は**損益及び包括利益計算書**で、包括利益を
-1 つの計算書にまとめる方式で出る。売上高から営業利益までは通常の損益計算書と同じ要素が同じ順で
-並び、後ろに包括利益が続くだけになる。実測 230 書類が該当し、そのすべてで `ci` が入って
-いなかった。落とすとその会社がまるごと空になる。
-
-### 検証
-
-800 件で試して 1 項目も取れない開示は 2 件 (0.25%) だった。名寄せた売上高を表紙の実績と
-突き合わせると 656 件中 655 件 (99.8%) が一致し、残る 1 件は会社側の記載ミスで訂正短信が
-出ているものだった。
-
-## 有報と短信をまとめて引く
-
-同じ 6 項目が両方から取れる。引くたびにどちらを見るか考えないで済むよう、ビューを 2 枚
-用意してある。年次は有報、四半期は短信という分担になる。
-
-| ビュー | 用途 |
-| --- | --- |
-| `financials` | 報告のぜんぶ。同じ期が何行も出る。**ある時点で何が分かっていたか**を再現する |
-| `latest_financials` | 期ごとに 1 行。今の姿を見る |
-
-`latest_financials` は同じ期を両方が報告していたら有報を採る。監査を通った確定値だから。
-通期の短信が出てから有報が出るまで 1.5 か月ほどあり、その間は短信しか無いのでそこは短信を
-採る。
-
-```sql
-SELECT period_kind, period_end, value / 1e6 AS 百万円, source
-FROM latest_financials
-WHERE code = '7203' AND item = 'net_sales'
-ORDER BY period_end DESC;
-```
-
-### 時点の再現には `financials` を使う
-
-`available_at` は「この値がこの書類で報告された日」を表す。有報の提出日と短信の開示日になる。
-決算日から短信まで 45 日、有報まで 3 か月あるので、決算期末の日付で引くと存在しない情報を
-使うことになる。
-
-```sql
--- 2025-08-01 の時点で分かっていた直近の年次売上
-SELECT DISTINCT ON (code) code, period_end, value, available_at
-FROM financials
-WHERE item = 'net_sales' AND period_kind = 'year' AND available_at <= '2025-08-01'
-ORDER BY code, period_end DESC, available_at DESC;
-```
-
-**`latest_financials` でこれをやってはいけない。** 有報は「主要な経営指標等」に 5 期分を
-載せるので、同じ期を何通もの書類が報告する。期ごとに 1 行へ絞ると、2019 年 3 月期の売上が
-「2025 年の有報で報告された」形になり、`available_at` が 2025 年になる。実際には 2019 年
-6 月に分かっていた。これで絞ると 2020 年時点の判定で 2019 年の売上が使えない。
-
-遡れる範囲には限りがある。EDINET の取得は 2025-01-06 から始めたので、それ以前に提出された
-書類は入っていない。2024 年より前の期のデータは「2025 年以降の書類が報告した過去の期」
-として入っており、その期の当時の報告そのものではない。
-
-### findocgen からのメタデータ移行
-
-過去分は TDnet から取り直せない。ZIP は `/mnt/usb/data/tdnet/` に 25773 件残っているが、
-メタデータは findocgen の PostgreSQL にしかない。1 度だけ移す。
-
-```bash
-FINDOCGEN_DATABASE_URL="$(grep '^DATABASE_URL=' ~/findocgen/.env | cut -d= -f2-)" \
-  ./scripts/import_findocgen_tdnet.sh
-```
-
-移した行は `sec_code` `markets` `xbrl_file` が NULL になる。findocgen が持っていない列
-だから。`downloaded_at` は埋まるので、実体を落とし直そうとはしない。
-
-## 株価
-
-Yahoo Finance の株価時系列ページから日次の四本値を取る。API は無いので HTML を読む。中身は
-Next.js の RSC ペイロードに JSON で載っているため、DOM ではなくそちらを解く。
-
-```bash
-uv run kabu fetch ticks                          # 銘柄ごとに最新取引日の翌日から
-uv run kabu fetch ticks --from 2024-01-04        # 全銘柄をその日から取り直す
-uv run kabu fetch ticks --codes 7203,6758        # 銘柄を絞る
-uv run kabu fetch ticks --only-jumps             # 終値が飛んでいる銘柄だけ
-```
-
-1 ページ 20 営業日。リクエストの間を 2 秒空ける。上場中の全銘柄で 2 時間かかるので、
-バッチは週次にしてある。上場廃止すると Yahoo からページごと消えるため、対象は
-`stocks.is_listed` が true の銘柄に限る。廃止前の株価は取り込み済みのぶんが残る。
-
-### 調整後終値を必ず持つ
-
-ページの 1 行は 8 つの値を持つ。始値・高値・安値・終値・出来高・**調整後終値**・PER・PBR。
-PER と PBR は直近の日にしか入らないので使わない。
-
-調整後終値は株式分割を遡って調整した値。これを持たないとバックテストが壊れる。前身の
-findocgen は捨てていて、234 万行のうち **590 か所・561 銘柄**に「前日比 45% 以上の飛び」が
-残っていた。全部が分割で、実際には起きていない暴落になる。分割するのは株価が上がった会社が
-多いので、成績が体系的に甘くなる。
-
-始値・高値・安値の調整値は提供されない。`adjusted_close / close` を掛けて揃える。
-
-### 分割は自動で追いかける
-
-分割が起きると Yahoo は過去の調整後終値をすべて書き換える。書き換わるのは**過去の行**なので、
-翌日から差分を取っているだけでは永久に気づけない。
-
-そこで差分取得は「最新取引日の翌日」ではなく「最新取引日そのもの」から取る。1 日ぶん重なる。
-重なった日の調整後終値が DB と違えば分割があったと分かるので、その銘柄を取り込み済みの
-最古日まで遡って取り直す。追加のリクエストは要らない。同じページに載っている。
-
-保険として、調整後終値の飛びからも洗い出せる。閾値に頼るので取りこぼしの確認に使う。
+移した行は findocgen が持っていなかった列が NULL になる。`ticks` は `adjusted_close`、
+`tdnet_disclosures` は `sec_code` `markets` `xbrl_file`。株価は移したあとに取り直す。
 
 ```bash
 uv run kabu fetch ticks --only-jumps --from 2024-01-04
 ```
 
-見るのは `close` ではなく調整後の値。`close` は分割の日に必ず飛ぶが、それは正常な値である。
-
-### findocgen からのデータ移行
-
-234 万行あるので psql の COPY で流す。`ticks` が空のときだけ実行できる。
-
-```bash
-FINDOCGEN_DATABASE_URL="$(grep '^DATABASE_URL=' ~/findocgen/.env | cut -d= -f2-)" \
-  ./scripts/import_findocgen_ticks.sh
-```
-
-移した行は `adjusted_close` が NULL になる。分割のあった銘柄は上のコマンドで取り直す。
-残りは分割していないので `close` をそのまま調整後とみなせる。
-
-### 取り直しの進捗はどこにも記録しない
-
-`--only-jumps` が毎回 DB から対象を計算する。取り直した銘柄は正しい `adjusted_close` が
-入って飛びが消えるので、次から対象外になる。何回中断しても、同じコマンドを叩けば残りだけを
-処理する。進捗を別に持たないのは、本体と食い違う余地を作らないため。
-
-ただし判定は前日比 45% という閾値に頼っているので、1.1 分割のような小さい分割は拾えない。
-
-### Yahoo は IP 単位で締める
-
-短時間に叩きすぎると 500 を返し始める。ブラウザからも返らなくなるので、UA や cookie の
-問題ではない。回復には数時間かかる。
-
-2026-08-21 に踏んだ。560 銘柄 × 32 ページ = 約 18000 リクエストを一度に流そうとして、23 分で
-締められた。findocgen が無傷だったのは、週次で 1 銘柄 1 ページ (3704 リクエストを 2 時間に
-分散) だったため。同じ 2 秒間隔でも、1 銘柄あたりのページ数が違うと密度がまるで変わる。
-
-遡って取り直すときは 50 銘柄ずつに区切る。2000 リクエストを 65 分なので、findocgen の週次
-(3704 リクエストを 2 時間) と同じ密度に収まる。夜間バッチに組み込んであるので、放っておけば
-1 晩 50 銘柄ずつ消化する。
-
 ## バッチ
 
-cron から 2 本。毎晩の `nightly.sh` と、週次の `weekly_ticks.sh`。スクリプトはリポジトリ直下に
-移動してから実行するので、cron 側で `cd` は要らない。
+cron から 2 本。スクリプトはリポジトリ直下に移動してから実行するので、cron 側で `cd` は
+要らない。順序と待ち方の理由はスクリプトの先頭コメントにある。
+
+`$HOME` はそのまま書ける。cron は `/etc/passwd` から `HOME` を入れ、コマンドを `/bin/sh`
+に通すため。リポジトリを別の場所に置いたときはここを直す。
 
 ```cron
-0 1 * * *  /home/takada/kabu-app/scripts/nightly.sh      2>&1 | /usr/bin/logger -t kabu
-0 5 * * 6  /home/takada/kabu-app/scripts/weekly_ticks.sh 2>&1 | /usr/bin/logger -t kabu-ticks
+0 1 * * *  $HOME/kabu-app/scripts/nightly.sh      2>&1 | /usr/bin/logger -t kabu
+0 5 * * 6  $HOME/kabu-app/scripts/weekly_ticks.sh 2>&1 | /usr/bin/logger -t kabu-ticks
 ```
 
 ```bash
@@ -857,9 +331,7 @@ journalctl -t kabu -n 100
 journalctl -t kabu-ticks -n 50
 ```
 
-### 毎晩 01:00
-
-JPX → EDINET → 解析 → 名寄せ → TDnet → 解析 → 名寄せ → 株価の遡り の順に回る。所要は 20〜105 分。
+`nightly.sh` は 8 つを順に回す。所要は 20〜105 分。
 
 | 順 | 処理 | 所要 |
 | --- | --- | --- |
@@ -872,40 +344,8 @@ JPX → EDINET → 解析 → 名寄せ → TDnet → 解析 → 名寄せ → �
 | 7 | 短信の名寄せ | 数秒 |
 | 8 | 株価の遡り (50 銘柄) | 65 分 |
 
-4 と 7 の名寄せは解析の直後に置く。ファクトから作るので、解析が入る前に走らせても空振り
-する。未処理のぶんだけを見るため、毎晩の増分は数十件で数秒に収まる。項目の定義を変えたときは
-バッチ任せにせず、手で `--renormalize` を流すこと。有報の全件で 9 分かかる。
-
-8 は株式分割で調整が狂った銘柄の取り直し。1 晩 50 銘柄に絞ってある。遡りは 1 銘柄で
-40 ページ近く叩くので、まとめて流すと Yahoo に締められる。対象が尽きれば 0 件で即座に
-終わるので、片付いたあとも置いたままでよい。
-
-株価の差分取得はここに入れない。日足は 1 日 1 本しか増えないのに、毎晩やると週 26000
-リクエストになる。
-
-01:00 に始めるのは TDnet の都合。開示が 23:55 まで出るので、日付が変わるまで待たないと
-当日ぶんを取りこぼす。TDnet は 31 日で消えるため、ここで取り逃すと二度と取れない。
-
-JPX を先頭に置くのは、新しく上場した銘柄を `stocks` に入れてから EDINET を取るため。
-月次更新のデータだが冪等で数秒なので、順序を保証するほうを取る。
-
-途中で 1 つ落ちても後続は走らせる。EDINET の失敗に巻き込まれて TDnet が止まるのが一番痛い
-ため。失敗があれば終了コード 1 で返すので、cron のログに残る。
-
-### 週次 土曜 05:00
-
-株価だけ別建てにしている。上場中の全銘柄を 2 秒間隔で叩くので 2 時間かかる。日足は 1 日
-1 本しか増えないため、毎晩やっても取れる量は変わらない。週 26000 リクエストと週 3700
-リクエストの差になる。
-
-### ロック
-
-両方とも `/tmp/kabu.lock` を使う。DB と回線を共有するので同時に走らせる意味がない。
-
-- `nightly.sh` は `flock -n`。前の実行が残っていれば黙って抜ける。毎晩機会があるため
-- `weekly_ticks.sh` は `flock -w 3600`。最大 1 時間待つ。週 1 回しか機会がないため
-
-systemd timer は使わない。ログは `logger` で journald に入り、実行順はスクリプトの中で決まる。
+`weekly_ticks.sh` は株価の取得だけ。上場中の全銘柄を 2 秒間隔で叩くので 2 時間かかる。
+両方とも `/tmp/kabu.lock` を共有する。DB と回線を分け合うので同時に走らせない。
 
 ## 開発
 

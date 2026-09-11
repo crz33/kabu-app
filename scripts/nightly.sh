@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 毎晩の取得をまとめて回す。JPX → EDINET → 解析 → 名寄せ → TDnet → 解析 → 名寄せ の順。
 #
-#   0 1 * * * /home/takada/kabu-app/scripts/nightly.sh 2>&1 | /usr/bin/logger -t kabu
+#   0 1 * * * $HOME/kabu-app/scripts/nightly.sh 2>&1 | /usr/bin/logger -t kabu
 #
 # 01:00 に始める。TDnet の開示は 23:55 まで出るので、日付が変わるまで待たないと当日ぶんを
 # 取りこぼす。所要は 10〜40 分。決算期の TDnet が重い日はもう少し伸びる。

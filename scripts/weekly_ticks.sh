@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Yahoo Finance から日次の株価を取得する。
 #
-#   0 5 * * 6 /home/takada/kabu-app/scripts/weekly_ticks.sh 2>&1 | /usr/bin/logger -t kabu-ticks
+#   0 5 * * 6 $HOME/kabu-app/scripts/weekly_ticks.sh 2>&1 | /usr/bin/logger -t kabu-ticks
 #
 # 土曜の 05:00 に週 1 回だけ回す。上場中の全銘柄を 2 秒間隔で叩くので 2 時間かかる。
 # 日足は 1 日 1 本しか増えないため、毎晩やっても取れる量は変わらない。週 26000 リクエストと
