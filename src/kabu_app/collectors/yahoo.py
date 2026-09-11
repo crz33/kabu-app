@@ -57,7 +57,12 @@ _USER_AGENT = (
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
-_RSC_PATTERN = re.compile(r"push\(\[1,(.+)\]\)\s*$", re.DOTALL)
+_PUSH_PREFIX = "self.__next_f.push("
+"""RSC のストリームを流し込む呼び出し. ここから 1 チャンクぶんの JSON が始まる."""
+
+_FLIGHT_ROW = re.compile(r"^[0-9a-f]+:[A-Za-z]?([\[{].*)$")
+"""flight の 1 行. id と、あれば型の文字を捨てて、JSON の本体だけを取る."""
+
 _MISSING_MARKS = frozenset({"", "---", "-"})
 
 # values の並び。6 番目以降の PER と PBR は直近の日にしか値が入らないので使わない。
@@ -181,29 +186,74 @@ def count_pages(total_size: int) -> int:
 def _extract_histories(content: bytes, code: str) -> tuple[list[dict[str, Any]], int]:
     """RSC ペイロードから株価の配列と総件数を取り出す."""
     tree = lxml_html.fromstring(content.decode("utf-8", errors="replace"))
+    rows = list(_flight_rows(_flight_stream(tree)))
 
-    for script in tree.iter("script"):
-        text = script.text
-        if text is None or "__next_f" not in text or "histories" not in text:
-            continue
-        match = _RSC_PATTERN.search(text)
-        if match is None:
-            continue
-        try:
-            # push([1, "<JSON 文字列>"]) の二重エンコード。外側を解いてから中身を解く。
-            decoded: str = json.loads(match.group(1))
-            payload = json.loads(decoded[decoded.index("[") :])
-        except (ValueError, json.JSONDecodeError):
-            continue
-
-        histories = _find_key(payload, "histories")
+    for row in rows:
+        histories = _find_key(row, "histories")
         if histories is None:
             continue
-        pager = _find_key(payload, "pager") or {}
+        pager = _find_key(row, "pager")
+        if pager is None:
+            # 件数だけ別の行に載ることがある。同じ行で見つからなければ全体から探す。
+            pager = next((found for r in rows if (found := _find_key(r, "pager")) is not None), {})
         return list(histories), int(pager.get("totalSize", 0))
 
     # 上場廃止した銘柄はページ自体が消えている。株価が 1 件も無いのと区別できない。
+    logger.debug("%s: flight の行が %d 本あったが histories が無かった", code, len(rows))
     raise YahooPageError(f"{code}: 株価を取り出せませんでした")
+
+
+def _flight_stream(tree: lxml_html.HtmlElement) -> str:
+    """ページ中の ``self.__next_f.push([1, "..."])`` をつないで flight を組み直す.
+
+    Next.js は RSC のストリームを複数の push に切って流す。切れ目は行の途中にも来るので、
+    1 つの push だけを見てはいけない。出現順につないでから行に割る。
+    """
+    decoder = json.JSONDecoder()
+    chunks: list[str] = []
+
+    for script in tree.iter("script"):
+        text = script.text
+        if text is None or _PUSH_PREFIX not in text:
+            continue
+        index = text.find(_PUSH_PREFIX)
+        while index != -1:
+            start = index + len(_PUSH_PREFIX)
+            try:
+                entry, end = decoder.raw_decode(text, start)
+            except json.JSONDecodeError:
+                index = text.find(_PUSH_PREFIX, start)
+                continue
+            if isinstance(entry, list) and len(entry) == 2 and entry[0] == 1:
+                if isinstance(entry[1], str):
+                    chunks.append(entry[1])
+            index = text.find(_PUSH_PREFIX, end)
+
+    return "".join(chunks)
+
+
+def _flight_rows(stream: str) -> Iterator[Any]:
+    """flight を行に割り、JSON として読める行だけを返す.
+
+    1 行は ``<16 進の id>:<JSON>`` になる。``3:I[339756,...]`` のようにモジュール参照を
+    表す型の文字が挟まる行もあり、こちらは株価を持たない。
+
+    先頭の ``[`` から読むことはできない。株価の行より前にモジュール参照の行が来るため、
+    ストリーム全体の最初の ``[`` はそちらの括弧に当たる。行ごとに読むこと。
+    """
+    decoder = json.JSONDecoder()
+
+    for line in stream.split("\n"):
+        match = _FLIGHT_ROW.match(line)
+        if match is None:
+            continue
+        body = match.group(1)
+        try:
+            value, _ = decoder.raw_decode(body)
+        except json.JSONDecodeError as error:
+            logger.debug("flight の行を読めなかった: %s / %.80s", error, line)
+            continue
+        yield value
 
 
 def _find_key(obj: Any, key: str) -> Any:

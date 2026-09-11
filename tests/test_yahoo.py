@@ -27,16 +27,37 @@ def _entry(
     return {"date": day, "values": [{"value": value} for value in values]}
 
 
+def _push(chunk: str) -> str:
+    """flight の 1 チャンクを push の呼び出しに包む."""
+    return f"self.__next_f.push([1,{json.dumps(chunk, ensure_ascii=False)}])"
+
+
 def _page(entries: list[dict[str, Any]], total_size: int) -> bytes:
     """RSC ペイロードを積んだページを組み立てる.
 
-    実物は push([1, "<JSON 文字列>"]) の二重エンコードで、文字列の頭に "a:" のような
-    印が付く。取り出す側は最初の "[" から読む。
+    実物は push([1, "<JSON 文字列>"]) の二重エンコードで、行の頭に "a:" のような id が付く。
     """
     payload = [{"pager": {"totalSize": total_size}, "histories": entries}]
-    inner = "a:" + json.dumps(payload, ensure_ascii=False)
-    script = f"self.__next_f.push([1,{json.dumps(inner, ensure_ascii=False)}])"
-    return f"<html><body><script>{script}</script></body></html>".encode()
+    chunk = "a:" + json.dumps(payload, ensure_ascii=False)
+    return f"<html><body><script>{_push(chunk)}</script></body></html>".encode()
+
+
+def _streamed_page(entries: list[dict[str, Any]], total_size: int) -> bytes:
+    """実物に近い形で組み立てる. モジュール参照の行が先に来て、push が複数に切れる.
+
+    2026-09 に Yahoo 側の切れ方が変わり、株価の行と同じチャンクにモジュール参照の行が
+    入るようになった。ストリーム全体の最初の "[" から読むと、参照側の括弧に当たる。
+    """
+    payload = [{"pager": {"totalSize": total_size}, "histories": entries}]
+    stream = (
+        '1:"$Sreact.fragment"\n'
+        '3:I[339756,["https://finance-frontend-pc-dist.west.edge.storage-yahoo.jp/x.js"],""]\n'
+        '4:HL["/_next/static/css/a.css","style"]\n'
+        "a:" + json.dumps(payload, ensure_ascii=False) + "\n"
+    )
+    half = len(stream) // 2
+    scripts = f"<script>{_push(stream[:half])}</script><script>{_push(stream[half:])}</script>"
+    return f"<html><body>{scripts}</body></html>".encode()
 
 
 def test_株価と総件数を取り出す() -> None:
@@ -46,10 +67,27 @@ def test_株価と総件数を取り出す() -> None:
     assert len(histories) == 1
 
 
+def test_モジュール参照の行を挟んでも株価を取り出す() -> None:
+    """先頭の "[" から読むと参照側の括弧に当たる。行ごとに読めているかを見る."""
+    histories, total_size = _extract_histories(_streamed_page([_entry()], 36), "7203")
+
+    assert total_size == 36
+    assert len(histories) == 1
+
+
 def test_ページの作りが変わったら例外() -> None:
     """RSC が見つからないのは、上場廃止でページが消えた場合も含む."""
     with pytest.raises(YahooPageError, match="7203"):
         _extract_histories(b"<html><body><p>404</p></body></html>", "7203")
+
+
+def test_株価の行が無ければ例外() -> None:
+    """flight は読めるが histories が無い場合。上場廃止の銘柄で起きる."""
+    chunk = "a:" + json.dumps([{"pager": {"totalSize": 0}}], ensure_ascii=False)
+    page = f"<html><body><script>{_push(chunk)}</script></body></html>".encode()
+
+    with pytest.raises(YahooPageError, match="7203"):
+        _extract_histories(page, "7203")
 
 
 def test_四本値と調整後終値を読む() -> None:
