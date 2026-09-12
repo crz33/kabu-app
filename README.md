@@ -232,6 +232,7 @@ uv run kabu fetch edinet                        # 前回の続きから今日ま
 uv run kabu fetch tdnet                         # 同上。31 日より前は取れない
 uv run kabu fetch ticks                         # 銘柄ごとに最新取引日から。2 時間かかる
 uv run kabu fetch ticks --only-jumps            # 調整後終値が飛んでいる銘柄だけ取り直す
+uv run kabu fetch ticks --missing-adjusted --from 2024-01-04   # 調整後終値が無い銘柄を遡って埋める
 uv run kabu parse edinet                        # 未解析の有報を解析する
 uv run kabu parse tdnet                         # 未解析の短信を解析する
 uv run kabu parse taxonomy 2026                 # タクソノミの標準ラベルを入れる
@@ -287,10 +288,10 @@ uv run kabu normalize tdnet-financials          # 短信の添付を同じ 6 項
   EDINET API は直近 5 年しか引けない。営業利益だけは載らないので当期と前期の 2 期になる
 - **TDnet は取り逃すと二度と取れない。** 一覧も実体も 31 日で消える。バッチを 1 か月止めると
   その期間は永久に欠ける
-- **株価は findocgen から引き継いだぶんの `adjusted_close` が NULL。** 分割のあった銘柄は
-  夜間バッチが 1 晩 50 銘柄ずつ取り直している。調整後終値は分割だけを直した値で配当は含まない
-  ため、分割の無い銘柄では `close` と同じになる。分析では `coalesce(adjusted_close, close)` で
-  よく、NULL を全銘柄で埋め直す必要は無い
+- **株価は findocgen から引き継いだぶんの `adjusted_close` が NULL。** 調整後終値は分割だけを
+  直した値で配当は含まないため、分割の無い銘柄では `close` と同じになる。分割のあった銘柄は
+  夜間バッチが取り直し済みで、残りも 1 晩 50 銘柄ずつ埋めている (2026-09 から 2 か月半)。
+  埋まるまでは `coalesce(adjusted_close, close)` で引く
 
 ## findocgen からの移行
 
@@ -334,7 +335,7 @@ journalctl -t kabu -n 100
 journalctl -t kabu-ticks -n 50
 ```
 
-`nightly.sh` は 8 つを順に回す。所要は 20〜105 分。
+`nightly.sh` は 9 つを順に回す。所要は 20〜170 分。
 
 | 順 | 処理 | 所要 |
 | --- | --- | --- |
@@ -345,7 +346,8 @@ journalctl -t kabu-ticks -n 50
 | 5 | TDnet | 5〜30 分 (決算期のピークで) |
 | 6 | TDnet 解析 | 1〜10 分 (決算期のピークで) |
 | 7 | 短信の名寄せ | 数秒 |
-| 8 | 株価の飛び直し (50 銘柄) | 65 分 |
+| 8 | 株価の飛び直し (50 銘柄) | 65 分。対象が尽きていれば数秒 |
+| 9 | 調整後終値の埋め戻し (50 銘柄) | 70 分。土曜は飛ばす。尽きれば数秒 |
 
 `weekly_ticks.sh` は株価の取得だけ。上場中の全銘柄を 2 秒間隔で叩くので 2 時間 20 分かかる。
 03:00 なのは `apt-daily-upgrade.timer` の窓 (06:00〜07:00) を避けるためで、理由はスクリプトの

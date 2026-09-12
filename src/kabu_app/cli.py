@@ -79,6 +79,7 @@ from kabu_app.stores.tdnet_fact import (
 )
 from kabu_app.stores.tdnet_fact import mark_parsed as mark_tdnet_parsed
 from kabu_app.stores.tick import (
+    codes_missing_adjusted,
     codes_with_price_jumps,
     earliest_dates,
     latest_prices,
@@ -476,6 +477,13 @@ def fetch_ticks(
         bool,
         typer.Option("--only-jumps", help="調整後終値が大きく飛んでいる銘柄だけを対象にする"),
     ] = False,
+    missing_adjusted: Annotated[
+        bool,
+        typer.Option(
+            "--missing-adjusted",
+            help="調整後終値が無い行を持つ銘柄だけを対象にする。--from と組み合わせて遡る",
+        ),
+    ] = False,
     max_codes: Annotated[
         int | None,
         typer.Option("--max-codes", help="1 回の実行で扱う銘柄数の上限。遡るときに小分けする"),
@@ -486,16 +494,20 @@ def fetch_ticks(
     1 ページ 20 営業日で、リクエストの間は 2 秒空ける。上場中の全銘柄を 1 年ぶん遡ると
     半日では終わらない。日々の更新は --from を省いて差分だけ取る。
     """
+    if missing_adjusted and from_date is None:
+        # 差分取得の起点は最新取引日なので、NULL の行に届かない。埋めるには遡る起点が要る。
+        raise typer.BadParameter("--missing-adjusted には --from が要る")
+
     settings = get_settings()
     end = date.fromisoformat(to_date) if to_date else date.today()
+    default_start = date.fromisoformat(from_date) if from_date is not None else None
 
     with session_scope(create_session_factory(settings.database_url)) as session:
-        targets = _resolve_tick_targets(session, codes, only_jumps)
+        targets = _resolve_tick_targets(session, codes, only_jumps, missing_adjusted, default_start)
         if max_codes is not None and len(targets) > max_codes:
             # 遡るときは 1 銘柄で何十ページも叩くため、まとめて流すと Yahoo に締められる。
             logger.info("%d 銘柄のうち先頭 %d 件だけ扱う", len(targets), max_codes)
             targets = targets[:max_codes]
-        default_start = date.fromisoformat(from_date) if from_date is not None else None
         previous = {} if default_start is not None else latest_prices(session)
 
         logger.info("株価を取得: %d 銘柄 / 終了日 %s", len(targets), end)
@@ -512,7 +524,13 @@ def fetch_ticks(
     logger.info("完了: %d 件保存 / 取得できなかった銘柄 %d 件", saved, failed)
 
 
-def _resolve_tick_targets(session: Session, codes: str | None, only_jumps: bool) -> list[str]:
+def _resolve_tick_targets(
+    session: Session,
+    codes: str | None,
+    only_jumps: bool,
+    missing_adjusted: bool = False,
+    since: date | None = None,
+) -> list[str]:
     """取得する銘柄を決める."""
     if codes is not None:
         return [code.strip() for code in codes.split(",") if code.strip()]
@@ -520,6 +538,10 @@ def _resolve_tick_targets(session: Session, codes: str | None, only_jumps: bool)
         jumps = codes_with_price_jumps(session)
         logger.info("調整後終値が飛んでいる銘柄が %d 件", len(jumps))
         return jumps
+    if missing_adjusted and since is not None:
+        missing = codes_missing_adjusted(session, since)
+        logger.info("調整後終値が無い銘柄が %d 件", len(missing))
+        return missing
     return listed_codes(session)
 
 

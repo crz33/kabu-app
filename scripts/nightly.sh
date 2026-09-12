@@ -14,6 +14,13 @@
 # 1 晩 50 銘柄に絞る。取り直しは 1 銘柄で 40 ページ近く叩くので、まとめて流すと締められる。
 # 対象が尽きれば 0 件で即座に終わる。
 #
+# その後ろに調整後終値の埋め戻し。findocgen から移した行は adjusted_close が NULL で、
+# 分割の無い銘柄では close と同じ値になる。値としては欠けていないが、分析のたびに
+# 「NULL は欠損か」を確かめる手間と勘違いが出るので埋める。2026-09 の時点で 3136 銘柄、
+# 1 晩 50 銘柄で 2 か月ほどかかる。こちらも尽きれば 0 件で終わる。
+# 土曜は飛ばす。03:00 の週次取得がロックを 1 時間しか待たないため、決算期に夜間が
+# 105 分かかった上にこれが 65 分乗ると、週次のほうが諦めてしまう。
+#
 # 取り直しても消えない飛びは tick_jump_checks に記録して、次の判定から外す。低位株の
 # 1 円刻みや、売買が成立しない日が続いた後の値付けは本物の値動きにあたる。記録しないと
 # 判定が毎晩同じ銘柄を拾い、同じ値を受け取るだけの取り直しを繰り返す。
@@ -69,6 +76,9 @@ run "TDnet"         uv run kabu fetch tdnet
 run "TDnet 解析"     uv run kabu parse tdnet
 run "短信の名寄せ"   uv run kabu normalize tdnet-financials
 run "株価の飛び直し" uv run kabu fetch ticks --only-jumps --from 2024-01-04 --max-codes 50
+if [ "$(date +%u)" != 6 ]; then
+    run "調整後終値の埋め戻し" uv run kabu fetch ticks --missing-adjusted --from 2024-01-04 --max-codes 50
+fi
 
 if [ ${#failed[@]} -gt 0 ]; then
     echo "失敗した処理: ${failed[*]}" >&2

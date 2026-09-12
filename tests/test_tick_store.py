@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from kabu_app.collectors.yahoo import DailyQuote
 from kabu_app.models import Stock, Tick, TickJumpCheck
 from kabu_app.stores.tick import (
+    codes_missing_adjusted,
     codes_with_price_jumps,
     earliest_dates,
     latest_prices,
@@ -261,3 +262,21 @@ def test_銘柄を指定すると他の銘柄は見ない(session: Session) -> N
     session.execute(text("UPDATE ticks SET adjusted_close = NULL WHERE code = '1234'"))
 
     assert price_jumps(session, codes=["5103"]) == [("5103", date(2026, 8, 21))]
+
+
+def test_調整後終値が無い上場銘柄を返す(session: Session) -> None:
+    """NULL の行が 1 つでもあれば対象。上場廃止と since より前の行は見ない."""
+    session.add_all([_stock("7203"), _stock("6758"), _stock("9999", is_listed=False)])
+    session.flush()
+    save_quotes(
+        session,
+        [
+            _quote(code="7203", date=date(2026, 8, 20), adjusted_close=None),
+            _quote(code="7203", date=date(2026, 8, 21)),
+            _quote(code="6758", date=date(2023, 12, 29), adjusted_close=None),
+            _quote(code="6758", date=date(2026, 8, 21)),
+            _quote(code="9999", date=date(2026, 8, 21), adjusted_close=None),
+        ],
+    )
+
+    assert codes_missing_adjusted(session, since=date(2024, 1, 4)) == ["7203"]

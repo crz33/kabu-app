@@ -67,6 +67,26 @@ def listed_codes(session: Session) -> list[str]:
     )
 
 
+def codes_missing_adjusted(session: Session, since: date) -> list[str]:
+    """調整後終値が入っていない行を持つ上場中の銘柄.
+
+    findocgen から移した行は adjusted_close が NULL のまま。分割の無い銘柄では close と
+    同じ値なので、値としては欠けていない。それでも埋めるのは、分析のたびに「NULL は欠損か」
+    「分割は直っているか」を確かめる手間と勘違いを無くすため。
+
+    since 以降の行だけを見る。取り直しは since から今日までを取るので、それより前の行は
+    埋まらず、対象に残り続けてしまう。
+    """
+    statement = (
+        select(Tick.code)
+        .join(Stock, Stock.code == Tick.code)
+        .where(Stock.is_listed.is_(True), Tick.date >= since, Tick.adjusted_close.is_(None))
+        .distinct()
+        .order_by(Tick.code)
+    )
+    return list(session.execute(statement).scalars())
+
+
 def save_quotes(session: Session, quotes: Sequence[DailyQuote]) -> int:
     """株価を取り込む. コミットは呼び出し側の責任."""
     if not quotes:
