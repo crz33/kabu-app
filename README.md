@@ -181,6 +181,7 @@ psql "$DATABASE_URL" -c '\d+ edinet_financials'
 | 計算書を刷られた形で読む | `edinet_statement_lines` |
 | 株価・出来高 | `ticks`。長期の比較は `adjusted_close` |
 | 大株主・オーナー比率 | `edinet_shareholders` |
+| 発行済株式数・自己株式数・予想 EPS・BPS | `tdnet_summary_facts` の表紙。時価総額と予想 PER はここから作る |
 
 名寄せの 6 項目は売上高・営業利益・経常利益・当期純利益・総資産・純資産。定義は
 `src/kabu_app/normalizers/financials.py` の `ITEM_SPECS` にある。
