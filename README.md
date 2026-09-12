@@ -288,7 +288,9 @@ uv run kabu normalize tdnet-financials          # 短信の添付を同じ 6 項
 - **TDnet は取り逃すと二度と取れない。** 一覧も実体も 31 日で消える。バッチを 1 か月止めると
   その期間は永久に欠ける
 - **株価は findocgen から引き継いだぶんの `adjusted_close` が NULL。** 分割のあった銘柄は
-  夜間バッチが 1 晩 50 銘柄ずつ取り直している
+  夜間バッチが 1 晩 50 銘柄ずつ取り直している。調整後終値は分割だけを直した値で配当は含まない
+  ため、分割の無い銘柄では `close` と同じになる。分析では `coalesce(adjusted_close, close)` で
+  よく、NULL を全銘柄で埋め直す必要は無い
 
 ## findocgen からの移行
 
